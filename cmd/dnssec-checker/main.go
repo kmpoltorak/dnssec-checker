@@ -1,4 +1,4 @@
-// Command dnssec-checker diagnoses the DNSSEC configuration of the zone that contains one name.
+// Command dnssec-checker validates the DNSSEC chain of trust of the zone that contains one name.
 package main
 
 import (
@@ -16,7 +16,10 @@ import (
 	"github.com/kmpoltorak/dnssec-checker/internal/checker"
 )
 
-var resolvConf = "/etc/resolv.conf"
+var (
+	resolvConf = "/etc/resolv.conf"
+	anchors    = checker.RootAnchors
+)
 
 var exitCodes = map[checker.Status]int{
 	checker.Secure:        0,
@@ -38,7 +41,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dnssec-checker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	resolver := fs.String("resolver", "", "resolver IP address with optional port, e.g. 192.0.2.53 or [2001:db8::53]:53\n(default: first nameserver in "+resolvConf+")")
-	trust := fs.Bool("trust-resolver", false, "trust the resolver's DNSSEC validation and the network path to it")
 	format := fs.String("format", "text", "output format: text or json")
 	timeout := fs.Duration("timeout", 3*time.Second, "time limit for one query attempt")
 	deadline := fs.Duration("deadline", 20*time.Second, "time limit for the whole run")
@@ -95,7 +97,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(ctx, *deadline)
 	defer cancel()
 	rep, err := checker.Run(ctx, checker.Config{
-		Resolver: addr, Trusted: *trust, Timeout: *timeout, WarnExpiry: *warnExpiry,
+		Resolver: addr, Timeout: *timeout, WarnExpiry: *warnExpiry, Anchors: anchors,
 	}, fs.Arg(0))
 	if err != nil {
 		return fail("%v", err)
@@ -103,13 +105,22 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if *format == "json" {
 		err = rep.JSON(stdout)
 	} else {
-		err = rep.Text(stdout)
+		err = rep.Text(stdout, isTerminal(stdout) && os.Getenv("NO_COLOR") == "")
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return exitCodes[checker.Indeterminate]
 	}
 	return exitCodes[rep.Status]
+}
+
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 func buildVersion() string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -17,468 +18,438 @@ var now = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
 const zone = "example.com."
 
-func testConfig(srv *dnstest.Server, trusted bool) Config {
+type fixture struct {
+	srv                *dnstest.Server
+	root, com, example *dnstest.Zone
+}
+
+// chain serves the signed chain . -> com. -> example.com.
+func chain(t *testing.T) fixture {
+	srv := dnstest.Start(t)
+	root, com, example := dnstest.Chain(t, srv, now)
+	return fixture{srv, root, com, example}
+}
+
+func (f fixture) config() Config {
 	return Config{
-		Resolver: srv.Addr, Trusted: trusted, Timeout: 200 * time.Millisecond,
-		WarnExpiry: 168 * time.Hour, Now: func() time.Time { return now },
+		Resolver: f.srv.Addr, Timeout: 200 * time.Millisecond, WarnExpiry: 168 * time.Hour,
+		Now: func() time.Time { return now }, Anchors: f.root.Anchor(),
 	}
 }
 
-func runCheck(t *testing.T, cfg Config, domain string) *Report {
+func (f fixture) run(t *testing.T, domain string) *Report {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	rep, err := Run(ctx, cfg, domain)
+	rep, err := Run(ctx, f.config(), domain)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return rep
 }
 
-func result(rep *Report, id string) Result {
-	for _, c := range rep.Checks {
-		if c.ID == id {
-			return c.Result
-		}
-	}
-	return "missing"
-}
-
-func wantChecks(t *testing.T, rep *Report, want map[string]Result) {
-	t.Helper()
-	for id, w := range want {
-		if got := result(rep, id); got != w {
-			t.Errorf("check %s = %s, want %s", id, got, w)
-		}
-	}
-}
-
 func wantStatus(t *testing.T, rep *Report, want Status) {
 	t.Helper()
 	if rep.Status != want {
-		t.Errorf("status = %s, want %s (%s); checks %+v; errors %v", rep.Status, want, rep.Summary, rep.Checks, rep.Errors)
+		t.Errorf("status = %s, want %s: %s\nchain %+v\nerrors %v", rep.Status, want, rep.Summary, rep.Chain, rep.Errors)
+	}
+	if rep.DNSSEC != statuses[want].verdict {
+		t.Errorf("dnssec = %q", rep.DNSSEC)
 	}
 }
 
-// signed starts a resolver serving a signed example.com with a KSK and a ZSK.
-func signed(t *testing.T, ad bool) (*dnstest.Server, *dnstest.Zone) {
-	srv := dnstest.Start(t)
-	z := dnstest.NewZone(t, zone, 257, 256)
-	srv.Signed(t, z, now, ad)
-	return srv, z
+// wantChain checks zone:result of every step.
+func wantChain(t *testing.T, rep *Report, want ...string) {
+	t.Helper()
+	var got []string
+	for _, s := range rep.Chain {
+		got = append(got, s.Zone+":"+s.Result)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("chain = %v, want %v", got, want)
+	}
 }
 
-func allPass() map[string]Result {
-	return map[string]Result{
-		"resolver.validation": Pass, "ds.match": Pass, "dnskey.present": Pass,
-		"dnskey.signatures": Pass, "soa.signatures": Pass, "signatures.expiry": Pass,
+func lastDetail(rep *Report) string {
+	if len(rep.Chain) == 0 {
+		return ""
 	}
+	return rep.Chain[len(rep.Chain)-1].Detail
 }
 
 func TestSecure(t *testing.T) {
-	srv, _ := signed(t, true)
-	rep := runCheck(t, testConfig(srv, true), "Example.COM")
+	f := chain(t)
+	rep := f.run(t, "Example.COM")
 	wantStatus(t, rep, Secure)
-	wantChecks(t, rep, allPass())
-	if *rep.Zone != zone || !*rep.NameExists || rep.ValidationMode != modeTrusted {
-		t.Errorf("zone %v, exists %v, mode %s", *rep.Zone, *rep.NameExists, rep.ValidationMode)
+	wantChain(t, rep, ".:ok", "com.:ok", "example.com.:ok", "example.com.:ok")
+	if *rep.Zone != zone || !*rep.NameExists || rep.Resolver.Agrees == nil || !*rep.Resolver.Agrees {
+		t.Errorf("zone %v, exists %v, agrees %v", *rep.Zone, *rep.NameExists, rep.Resolver.Agrees)
 	}
-	if len(rep.Records.DS) != 1 || rep.Records.DS[0].Match != "match" || len(rep.Records.DNSKEY) != 2 || len(rep.Records.RRSIG) != 2 {
-		t.Errorf("records %+v", rep.Records)
+	ev := strings.Join(rep.Chain[2].Records, "\n")
+	for _, want := range []string{
+		"example.com. DS ", "RRSIG DS 13 by com.",
+		fmt.Sprintf("(key tag %d, KSK)", f.example.Keys[0].KeyTag()), "RRSIG DNSKEY 13 by example.com.",
+	} {
+		if !strings.Contains(ev, want) {
+			t.Errorf("evidence lacks %q:\n%s", want, ev)
+		}
 	}
-	if len(rep.Errors) != 0 || len(rep.Warnings) != 0 {
-		t.Errorf("errors %v, warnings %v", rep.Errors, rep.Warnings)
+	if len(rep.Warnings) != 0 || len(rep.Errors) != 0 {
+		t.Errorf("warnings %v, errors %v", rep.Warnings, rep.Errors)
 	}
 }
 
-func TestSecureNeedsTrust(t *testing.T) {
-	srv, _ := signed(t, true)
-	rep := runCheck(t, testConfig(srv, false), zone)
-	wantStatus(t, rep, Indeterminate)
-	want := allPass()
-	want["resolver.validation"] = Unknown
-	wantChecks(t, rep, want)
-}
-
-func TestSignedButNotAuthenticated(t *testing.T) {
-	srv, _ := signed(t, false)
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Indeterminate)
-	wantChecks(t, rep, map[string]Result{"resolver.validation": Unknown, "ds.match": Pass})
+func TestNameInZone(t *testing.T) {
+	t.Run("NODATA below the apex", func(t *testing.T) {
+		f := chain(t)
+		f.srv.Set("www.example.com.", dns.TypeSOA, dnstest.Reply{Ns: f.example.Signed(t, f.example.SOA(t))})
+		rep := f.run(t, "www.example.com")
+		wantStatus(t, rep, Secure)
+		if *rep.Zone != zone || !*rep.NameExists {
+			t.Errorf("zone %v, exists %v", *rep.Zone, *rep.NameExists)
+		}
+	})
+	t.Run("NXDOMAIN", func(t *testing.T) {
+		f := chain(t)
+		f.srv.Set("nope.example.com.", dns.TypeSOA, dnstest.Reply{Rcode: dns.RcodeNameError, Ns: f.example.Signed(t, f.example.SOA(t))})
+		rep := f.run(t, "nope.example.com")
+		wantStatus(t, rep, Secure) // the zone status is independent of the name
+		if *rep.Zone != zone || *rep.NameExists {
+			t.Errorf("zone %v, exists %v", *rep.Zone, *rep.NameExists)
+		}
+	})
+	t.Run("no authority section, walks to the parent", func(t *testing.T) {
+		f := chain(t)
+		f.srv.Set("a.b.example.com.", dns.TypeSOA, dnstest.Reply{})
+		f.srv.Set("b.example.com.", dns.TypeSOA, dnstest.Reply{})
+		rep := f.run(t, "a.b.example.com")
+		wantStatus(t, rep, Secure)
+		if *rep.Zone != zone {
+			t.Errorf("zone %v", *rep.Zone)
+		}
+	})
+	t.Run("signed delegated subdomain", func(t *testing.T) {
+		f := chain(t)
+		sub := dnstest.NewZone(t, "sub.example.com.", now, 257)
+		f.srv.Serve(t, sub)
+		f.srv.Delegate(t, f.example, sub)
+		rep := f.run(t, "sub.example.com")
+		wantStatus(t, rep, Secure)
+		wantChain(t, rep, ".:ok", "com.:ok", "example.com.:ok", "sub.example.com.:ok", "sub.example.com.:ok")
+	})
+	t.Run("labels that are not delegations are skipped", func(t *testing.T) {
+		f := chain(t)
+		sub := dnstest.NewZone(t, "a.b.example.com.", now, 257)
+		f.srv.Serve(t, sub)
+		f.srv.Delegate(t, f.example, sub)
+		f.srv.NoDS(t, f.example, "b.example.com.", "A RRSIG NSEC")
+		rep := f.run(t, "a.b.example.com")
+		wantStatus(t, rep, Secure)
+		wantChain(t, rep, ".:ok", "com.:ok", "example.com.:ok", "a.b.example.com.:ok", "a.b.example.com.:ok")
+	})
 }
 
 func TestInsecure(t *testing.T) {
-	srv := dnstest.Start(t)
-	srv.Unsigned(t, zone, "com.", true)
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Insecure)
-	wantChecks(t, rep, map[string]Result{"ds.match": NA, "dnskey.present": NA, "dnskey.signatures": NA, "soa.signatures": NA})
-	if !rep.Records.NSEC || rep.Records.DS == nil || len(rep.Records.DS) != 0 {
-		t.Errorf("NSEC %t, DS %v", rep.Records.NSEC, rep.Records.DS)
-	}
-}
-
-func TestMissingDSWithoutProof(t *testing.T) {
-	t.Run("AD=0", func(t *testing.T) {
-		srv := dnstest.Start(t)
-		srv.Unsigned(t, zone, "com.", false)
-		wantStatus(t, runCheck(t, testConfig(srv, true), zone), Indeterminate)
+	t.Run("NSEC at the delegation", func(t *testing.T) {
+		f := chain(t)
+		f.srv.ServeUnsigned(t, zone)
+		f.srv.NoDS(t, f.com, zone, "NS RRSIG NSEC")
+		rep := f.run(t, zone)
+		wantStatus(t, rep, Insecure)
+		wantChain(t, rep, ".:ok", "com.:ok", "example.com.:insecure")
+		if !strings.Contains(strings.Join(rep.Chain[2].Records, "\n"), "example.com. NSEC zz.example.com. NS RRSIG NSEC") {
+			t.Errorf("evidence %v", rep.Chain[2].Records)
+		}
+		if rep.Resolver.Agrees == nil || !*rep.Resolver.Agrees {
+			t.Errorf("resolver answered AD=0 and should agree: %+v", rep.Resolver)
+		}
 	})
-	t.Run("empty answer without parent SOA", func(t *testing.T) {
-		srv := dnstest.Start(t)
-		srv.Unsigned(t, zone, "com.", true)
-		srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true})
-		wantStatus(t, runCheck(t, testConfig(srv, true), zone), Indeterminate)
+	t.Run("NSEC3 at the delegation", func(t *testing.T) {
+		f := chain(t)
+		f.srv.ServeUnsigned(t, zone)
+		match := nsec3("com.", hashOf(zone), maxHash, 0, dns.TypeNS)
+		f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: f.com.Signed(t, match)})
+		rep := f.run(t, zone)
+		wantStatus(t, rep, Insecure)
+		if !strings.Contains(lastDetail(rep), "NSEC3 record") {
+			t.Errorf("detail %q", lastDetail(rep))
+		}
 	})
-	t.Run("negative answer carrying the zone's own SOA", func(t *testing.T) {
-		srv := dnstest.Start(t)
-		srv.Unsigned(t, zone, "com.", true)
-		srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true, Ns: []dns.RR{dnstest.ParentSOA(t, zone)}})
-		wantStatus(t, runCheck(t, testConfig(srv, true), zone), Indeterminate)
+	t.Run("NSEC3 opt-out", func(t *testing.T) {
+		f := chain(t)
+		f.srv.ServeUnsigned(t, zone)
+		ce := nsec3("com.", hashOf("com."), maxHash, 0, dns.TypeNS, dns.TypeSOA)
+		cover := nsec3("com.", "00000000000000000000000000000000", maxHash, 1, dns.TypeNS)
+		f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: append(f.com.Signed(t, ce), f.com.Signed(t, cover)...)})
+		rep := f.run(t, zone)
+		wantStatus(t, rep, Insecure)
+		if !strings.Contains(lastDetail(rep), "opt-out") {
+			t.Errorf("detail %q", lastDetail(rep))
+		}
 	})
-	t.Run("untrusted", func(t *testing.T) {
-		srv := dnstest.Start(t)
-		srv.Unsigned(t, zone, "com.", true)
-		wantStatus(t, runCheck(t, testConfig(srv, false), zone), Indeterminate)
+	t.Run("zone below an unsigned zone", func(t *testing.T) {
+		f := chain(t)
+		f.srv.ServeUnsigned(t, zone)
+		f.srv.NoDS(t, f.com, zone, "NS RRSIG NSEC")
+		f.srv.ServeUnsigned(t, "sub.example.com.")
+		rep := f.run(t, "sub.example.com")
+		wantStatus(t, rep, Insecure)
+		wantChain(t, rep, ".:ok", "com.:ok", "example.com.:insecure")
+		if !strings.Contains(rep.Summary, "below example.com.") {
+			t.Errorf("summary %q", rep.Summary)
+		}
+	})
+	t.Run("only unsupported algorithm", func(t *testing.T) {
+		f := chain(t)
+		ds := f.example.DS(0)
+		ds.Algorithm = dns.ED448
+		f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: f.com.Signed(t, ds)})
+		rep := f.run(t, zone)
+		wantStatus(t, rep, Insecure)
+		wantChain(t, rep, ".:ok", "com.:ok", "example.com.:insecure")
+	})
+	t.Run("only unsupported digest", func(t *testing.T) {
+		f := chain(t)
+		ds := f.example.DS(0)
+		ds.DigestType = dns.GOST94
+		f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: f.com.Signed(t, ds)})
+		wantStatus(t, f.run(t, zone), Insecure)
 	})
 }
 
-func TestIslandOfTrust(t *testing.T) {
-	srv, _ := signed(t, false)
-	srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true, Ns: []dns.RR{dnstest.ParentSOA(t, "com.")}})
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Insecure)
-	if !slices.ContainsFunc(rep.Warnings, func(w string) bool { return strings.Contains(w, "island of trust") }) {
-		t.Errorf("warnings %v", rep.Warnings)
-	}
-}
-
-func TestDSMismatch(t *testing.T) {
-	srv, z := signed(t, true)
-	ds := z.DS(0)
-	ds.Digest = strings.Repeat("00", 32) // same key tag and algorithm, wrong digest
-	srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true, Answer: []dns.RR{ds}})
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Indeterminate)
-	wantChecks(t, rep, map[string]Result{"ds.match": Fail, "resolver.validation": Pass})
-	if rep.Records.DS[0].Match != "no_match" {
-		t.Errorf("DS %+v", rep.Records.DS)
-	}
-}
-
-func TestDNSKEYMissing(t *testing.T) {
-	srv, z := signed(t, true)
-	srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{AD: true, Ns: []dns.RR{z.SOA(t)}})
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Indeterminate)
-	wantChecks(t, rep, map[string]Result{"dnskey.present": Fail, "ds.match": Fail, "soa.signatures": Unknown})
-}
-
-func TestSOASignatureProblems(t *testing.T) {
+func TestBogus(t *testing.T) {
 	day := 24 * time.Hour
 	tests := []struct {
-		name      string
-		from, to  time.Time
-		corrupt   bool
-		wantTime  string
-		wantCheck Result
+		name   string
+		break_ func(t *testing.T, f fixture)
+		at     string // zone of the failing step
+		why    string // part of the step detail
 	}{
-		{"corrupted", now.Add(-day), now.Add(30 * day), true, "valid", Fail},
-		{"expired", now.Add(-30 * day), now.Add(-day), false, "expired", Fail},
-		{"not yet valid", now.Add(day), now.Add(30 * day), false, "not_yet_valid", Fail},
+		{"DS digest does not match", func(t *testing.T, f fixture) {
+			ds := f.example.DS(0)
+			ds.Digest = strings.Repeat("00", 32) // same key tag and algorithm
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: f.com.Signed(t, ds)})
+		}, zone, "no DNSKEY matches the DS"},
+		{"DS for a key that is not published", func(t *testing.T, f fixture) {
+			other := dnstest.NewZone(t, zone, now, 257)
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: f.com.Signed(t, other.DS(0))})
+		}, zone, "no DNSKEY matches the DS"},
+		{"DNSKEY missing", func(t *testing.T, f fixture) {
+			f.srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Ns: f.example.Signed(t, f.example.SOA(t))})
+		}, zone, "publishes no DNSKEY"},
+		{"DNSKEY set signed only by a key without DS", func(t *testing.T, f fixture) {
+			keys := f.example.KeySet()
+			f.srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Answer: f.example.Signed(t, keys...)})
+		}, zone, "not validly signed by the key the DS points to"},
+		{"DNSKEY signature expired", func(t *testing.T, f fixture) {
+			keys := f.example.KeySet()
+			f.srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Answer: append(keys, f.example.Sign(t, 0, keys, now.Add(-30*day), now.Add(-day)))})
+		}, zone, "is valid only from"},
+		{"SOA signature corrupted", func(t *testing.T, f fixture) {
+			set := f.example.Signed(t, f.example.SOA(t))
+			sig := set[1].(*dns.RRSIG)
+			b, _ := base64.StdEncoding.DecodeString(sig.Signature)
+			b[0] ^= 0xff
+			sig.Signature = base64.StdEncoding.EncodeToString(b)
+			f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{Answer: set})
+		}, zone, "does not verify"},
+		{"SOA signature expired", func(t *testing.T, f fixture) {
+			soa := []dns.RR{f.example.SOA(t)}
+			f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{Answer: append(soa, f.example.Sign(t, 1, soa, now.Add(-30*day), now.Add(-day)))})
+		}, zone, "is valid only from"},
+		{"SOA signature not yet valid", func(t *testing.T, f fixture) {
+			soa := []dns.RR{f.example.SOA(t)}
+			f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{Answer: append(soa, f.example.Sign(t, 1, soa, now.Add(day), now.Add(30*day)))})
+		}, zone, "is valid only from"},
+		{"SOA not signed", func(t *testing.T, f fixture) {
+			f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{Answer: []dns.RR{f.example.SOA(t)}})
+		}, zone, "no RRSIG covers the SOA"},
+		{"DS not signed", func(t *testing.T, f fixture) {
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: []dns.RR{f.example.DS(0)}})
+		}, zone, "no RRSIG covers the DS"},
+		{"DS signed by the child instead of the parent", func(t *testing.T, f fixture) {
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: f.example.Signed(t, f.example.DS(0))})
+		}, zone, "signed by example.com. instead of com."},
+		{"no DS and no proof", func(t *testing.T, f fixture) {
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: f.com.Signed(t, f.com.SOA(t))})
+		}, zone, "no valid signed proof"},
+		{"proof says DS exists", func(t *testing.T, f fixture) {
+			f.srv.NoDS(t, f.com, zone, "NS DS RRSIG NSEC")
+		}, zone, "no valid signed proof"},
+		{"unsigned proof", func(t *testing.T, f fixture) {
+			nsec := dnstest.RR(t, "example.com. 3600 IN NSEC zz.example.com. NS RRSIG NSEC")
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: []dns.RR{nsec}})
+		}, zone, "no valid signed proof"},
+		{"proof signed by the child", func(t *testing.T, f fixture) {
+			nsec := dnstest.RR(t, "example.com. 3600 IN NSEC zz.example.com. NS RRSIG NSEC")
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: f.example.Signed(t, nsec)})
+		}, zone, "no valid signed proof"},
+		{"NSEC3 without opt-out does not prove an unsigned delegation", func(t *testing.T, f fixture) {
+			ce := nsec3("com.", hashOf("com."), maxHash, 0, dns.TypeNS, dns.TypeSOA)
+			cover := nsec3("com.", "00000000000000000000000000000000", maxHash, 0, dns.TypeNS)
+			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: append(f.com.Signed(t, ce), f.com.Signed(t, cover)...)})
+		}, zone, "no valid signed proof"},
+		{"parent proves the zone is not a delegation", func(t *testing.T, f fixture) {
+			f.srv.NoDS(t, f.com, zone, "A RRSIG NSEC")
+		}, zone, "is not a delegation"},
+		{"wrong trust anchor", func(t *testing.T, f fixture) {
+			other := dnstest.NewZone(t, ".", now, 257)
+			f.root.Keys = other.Keys // changes Anchor()
+		}, ".", "no DNSKEY matches the trust anchor"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, z := signed(t, true)
-			soa := []dns.RR{z.SOA(t)}
-			sig := z.Sign(t, 1, soa, tt.from, tt.to)
-			if tt.corrupt {
-				b, _ := base64.StdEncoding.DecodeString(sig.Signature)
-				b[0] ^= 0xff
-				sig.Signature = base64.StdEncoding.EncodeToString(b)
-			}
-			srv.Set(zone, dns.TypeSOA, dnstest.Reply{AD: true, Answer: append(soa, sig)})
-			rep := runCheck(t, testConfig(srv, true), zone)
-			wantStatus(t, rep, Indeterminate) // AD=1 contradicts the local result
-			wantChecks(t, rep, map[string]Result{"soa.signatures": tt.wantCheck, "dnskey.signatures": Pass})
-			i := slices.IndexFunc(rep.Records.RRSIG, func(s RRSIG) bool { return s.Covers == "SOA" })
-			if s := rep.Records.RRSIG[i]; s.Time != tt.wantTime || (s.Signature == "valid") == tt.corrupt {
-				t.Errorf("RRSIG %+v", s)
+			f := chain(t)
+			tt.break_(t, f)
+			rep := f.run(t, zone)
+			wantStatus(t, rep, Bogus)
+			s := rep.Chain[len(rep.Chain)-1]
+			if s.Zone != tt.at || s.Result != StepFail || !strings.Contains(s.Detail, tt.why) {
+				t.Errorf("last step %+v, want a failure at %s mentioning %q", s, tt.at, tt.why)
 			}
 		})
 	}
 }
 
 func TestRolloverWithOneGoodSignature(t *testing.T) {
-	srv := dnstest.Start(t)
-	z := dnstest.NewZone(t, zone, 257, 257, 256) // new KSK, old KSK, ZSK
-	srv.Signed(t, z, now, true)
+	f := chain(t)
+	z := dnstest.NewZone(t, zone, now, 257, 257, 256) // new KSK, old KSK, ZSK
+	f.srv.Serve(t, z)
 	keys := z.KeySet()
 	expired := z.Sign(t, 1, keys, now.Add(-60*24*time.Hour), now.Add(-time.Hour))
 	good := z.Sign(t, 0, keys, now.Add(-time.Hour), now.Add(30*24*time.Hour))
-	srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{AD: true, Answer: append(keys, expired, good)})
+	f.srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Answer: append(keys, expired, good)})
 	stale := z.DS(1)
 	stale.Digest = strings.Repeat("ab", 32)
-	srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true, Answer: []dns.RR{stale, z.DS(0)}})
-
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Secure)
-	wantChecks(t, rep, allPass())
-}
-
-func TestDNSKEYSignedOnlyByKeyWithoutDS(t *testing.T) {
-	srv := dnstest.Start(t)
-	z := dnstest.NewZone(t, zone, 257, 256)
-	srv.Signed(t, z, now, true)
-	keys := z.KeySet()
-	srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{AD: true, Answer: append(keys, z.Sign(t, 1, keys, now.Add(-time.Hour), now.Add(720*time.Hour)))})
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Indeterminate)
-	wantChecks(t, rep, map[string]Result{"ds.match": Pass, "dnskey.signatures": Fail})
+	f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: f.com.Signed(t, stale, z.DS(0))})
+	wantStatus(t, f.run(t, zone), Secure)
 }
 
 func TestKeyTagCollision(t *testing.T) {
-	srv := dnstest.Start(t)
-	z := dnstest.NewZone(t, zone, 257)
-	real := z.Keys[0]
+	f := chain(t)
+	real := f.example.Keys[0]
 	fake := &dns.DNSKEY{Hdr: real.Hdr, Flags: 257, Protocol: 3, Algorithm: real.Algorithm}
 	b := make([]byte, 64)
 	for fake.KeyTag() != real.KeyTag() {
 		rand.Read(b)
 		fake.PublicKey = base64.StdEncoding.EncodeToString(b)
 	}
-	z.Keys = []*dns.DNSKEY{fake, real} // the colliding key is tried first
-	from, until := now.Add(-time.Hour), now.Add(720*time.Hour)
-	soa, keys := []dns.RR{z.SOA(t)}, z.KeySet()
-	srv.Set(zone, dns.TypeSOA, dnstest.Reply{AD: true, Answer: append(soa, z.Sign(t, 1, soa, from, until))})
-	srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{AD: true, Answer: append(keys, z.Sign(t, 1, keys, from, until))})
-	srv.Set(zone, dns.TypeNS, dnstest.Reply{AD: true, Answer: []dns.RR{z.NS(t)}})
-	srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true, Answer: []dns.RR{z.DS(1)}})
-
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Secure)
-	wantChecks(t, rep, allPass())
+	keys := append([]dns.RR{fake}, f.example.KeySet()...) // the colliding key is tried first
+	f.srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Answer: append(keys, f.example.Sign(t, 0, keys, now.Add(-time.Hour), now.Add(time.Hour*720)))})
+	wantStatus(t, f.run(t, zone), Secure)
 }
 
-func TestUnsupportedAlgorithmIsNotBogus(t *testing.T) {
-	srv := dnstest.Start(t)
-	z := &dnstest.Zone{Name: zone}
-	key := &dns.DNSKEY{
-		Hdr:   dns.RR_Header{Name: zone, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
-		Flags: 257, Protocol: 3, Algorithm: dns.ED448,
-		PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 57)),
-	}
-	sig := func(covered uint16) *dns.RRSIG {
-		return &dns.RRSIG{
-			Hdr:         dns.RR_Header{Name: zone, Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 3600},
-			TypeCovered: covered, Algorithm: dns.ED448, Labels: 2, OrigTtl: 3600, KeyTag: key.KeyTag(), SignerName: zone,
-			Inception: uint32(now.Add(-time.Hour).Unix()), Expiration: uint32(now.Add(720 * time.Hour).Unix()),
-			Signature: base64.StdEncoding.EncodeToString(make([]byte, 114)),
-		}
-	}
-	srv.Set(zone, dns.TypeSOA, dnstest.Reply{Answer: []dns.RR{z.SOA(t), sig(dns.TypeSOA)}})
-	srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Answer: []dns.RR{key, sig(dns.TypeDNSKEY)}})
-	srv.Set(zone, dns.TypeNS, dnstest.Reply{Answer: []dns.RR{z.NS(t)}})
-	srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true, Answer: []dns.RR{key.ToDS(dns.SHA256)}})
-
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Indeterminate)
-	wantChecks(t, rep, map[string]Result{"ds.match": Pass, "dnskey.signatures": Unknown, "soa.signatures": Unknown})
-	for _, s := range rep.Records.RRSIG {
-		if s.Signature != "unsupported" {
-			t.Errorf("RRSIG %+v", s)
-		}
-	}
+func TestMixedSupportedAndUnsupportedDS(t *testing.T) {
+	f := chain(t)
+	gost := f.example.DS(0)
+	gost.DigestType = dns.GOST94
+	f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Answer: f.com.Signed(t, gost, f.example.DS(0))})
+	wantStatus(t, f.run(t, zone), Secure)
 }
 
-func TestUnsupportedDigest(t *testing.T) {
-	srv, z := signed(t, true)
-	ds := z.DS(0)
-	ds.DigestType = dns.GOST94
-	srv.Set(zone, dns.TypeDS, dnstest.Reply{AD: true, Answer: []dns.RR{ds}})
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Indeterminate)
-	wantChecks(t, rep, map[string]Result{"ds.match": Unknown})
-	if rep.Records.DS[0].Match != "unsupported_digest" {
-		t.Errorf("DS %+v", rep.Records.DS)
-	}
-}
-
-func TestSERVFAIL(t *testing.T) {
-	tests := []struct {
-		name    string
-		ede     []uint16
-		trusted bool
-		want    Status
-	}{
-		{"DNSSEC Bogus EDE, trusted", []uint16{dns.ExtendedErrorCodeDNSBogus}, true, Bogus},
-		{"Signature Expired EDE, trusted", []uint16{dns.ExtendedErrorCodeSignatureExpired}, true, Bogus},
-		{"DNSSEC Bogus EDE, untrusted", []uint16{dns.ExtendedErrorCodeDNSBogus}, false, Indeterminate},
-		{"no EDE", nil, true, Indeterminate},
-		{"unrelated EDE", []uint16{dns.ExtendedErrorCodeNoReachableAuthority, dns.ExtendedErrorCodeNetworkError}, true, Indeterminate},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv, z := signed(t, true)
-			soa := []dns.RR{z.SOA(t)}
-			srv.Set(zone, dns.TypeSOA, dnstest.Reply{Rcode: dns.RcodeServerFailure, EDE: tt.ede})
-			srv.SetCD(zone, dns.TypeSOA, dnstest.Reply{Answer: append(soa, z.Sign(t, 1, soa, now.Add(-time.Hour), now.Add(720*time.Hour)))})
-			rep := runCheck(t, testConfig(srv, tt.trusted), zone)
-			wantStatus(t, rep, tt.want)
-			if rep.Zone == nil || *rep.Zone != zone {
-				t.Errorf("zone %v", rep.Zone)
-			}
-			// The CD=1 answer is used for local diagnostics only.
-			wantChecks(t, rep, map[string]Result{"soa.signatures": Pass})
-			if !slices.ContainsFunc(rep.Queries, func(q Query) bool { return q.CD && q.Type == "SOA" }) {
-				t.Error("no CD=1 query recorded")
-			}
-		})
-	}
-}
-
-func TestCDAnswerDoesNotMakeSecure(t *testing.T) {
-	srv, z := signed(t, true)
-	from, until := now.Add(-time.Hour), now.Add(720*time.Hour)
-	soa, keys := []dns.RR{z.SOA(t)}, z.KeySet()
-	for qtype, ans := range map[uint16][]dns.RR{
-		dns.TypeSOA:    append(soa, z.Sign(t, 1, soa, from, until)),
-		dns.TypeDNSKEY: append(keys, z.Sign(t, 0, keys, from, until)),
-	} {
-		srv.Set(zone, qtype, dnstest.Reply{Rcode: dns.RcodeServerFailure})
-		srv.SetCD(zone, qtype, dnstest.Reply{AD: true, Answer: ans})
-	}
-	rep := runCheck(t, testConfig(srv, true), zone)
-	wantStatus(t, rep, Indeterminate)
-	wantChecks(t, rep, map[string]Result{"ds.match": Pass, "dnskey.signatures": Pass, "soa.signatures": Pass, "resolver.validation": Unknown})
-}
-
-func TestNameInZone(t *testing.T) {
-	t.Run("NXDOMAIN", func(t *testing.T) {
-		srv, z := signed(t, true)
-		srv.Set("nope.example.com.", dns.TypeSOA, dnstest.Reply{Rcode: dns.RcodeNameError, AD: true, Ns: []dns.RR{
-			z.SOA(t), dnstest.RR(t, "example.com. 3600 IN NSEC www.example.com. NS SOA RRSIG NSEC DNSKEY"),
-		}})
-		rep := runCheck(t, testConfig(srv, true), "nope.example.com")
-		wantStatus(t, rep, Secure) // the zone status is independent of the name
-		if rep.NameExists == nil || *rep.NameExists || *rep.Zone != zone || !rep.Records.NSEC {
-			t.Errorf("exists %v, zone %v, nsec %t", rep.NameExists, *rep.Zone, rep.Records.NSEC)
+func TestResolver(t *testing.T) {
+	t.Run("strips RRSIG", func(t *testing.T) {
+		f := chain(t)
+		f.srv.Set(".", dns.TypeDNSKEY, dnstest.Reply{Answer: f.root.KeySet()})
+		rep := f.run(t, zone)
+		wantStatus(t, rep, Indeterminate)
+		if !strings.Contains(rep.Summary, "does not pass DNSSEC records") {
+			t.Errorf("summary %q", rep.Summary)
 		}
 	})
-	t.Run("NODATA below the apex", func(t *testing.T) {
-		srv, z := signed(t, true)
-		srv.Set("www.example.com.", dns.TypeSOA, dnstest.Reply{AD: true, Ns: []dns.RR{z.SOA(t)}})
-		rep := runCheck(t, testConfig(srv, true), "www.example.com")
+	t.Run("own validation disagrees, local result wins", func(t *testing.T) {
+		f := chain(t)
+		f.srv.SetCD(zone, dns.TypeSOA, dnstest.Reply{Answer: f.example.Signed(t, f.example.SOA(t))})
+		f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{Rcode: dns.RcodeServerFailure, EDE: []uint16{dns.ExtendedErrorCodeDNSBogus}})
+		rep := f.run(t, zone)
 		wantStatus(t, rep, Secure)
-		if !*rep.NameExists || *rep.Zone != zone {
-			t.Errorf("exists %v, zone %v", *rep.NameExists, *rep.Zone)
+		if rep.Resolver.Agrees == nil || *rep.Resolver.Agrees || len(rep.Warnings) != 1 || rep.Resolver.Response.EDE[0].Code != 6 {
+			t.Errorf("resolver %+v, warnings %v", rep.Resolver, rep.Warnings)
 		}
 	})
-	t.Run("no authority section, walks to the parent", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		srv.Set("a.b.example.com.", dns.TypeSOA, dnstest.Reply{AD: true})
-		srv.Set("b.example.com.", dns.TypeSOA, dnstest.Reply{AD: true})
-		rep := runCheck(t, testConfig(srv, true), "a.b.example.com")
-		if rep.Zone == nil || *rep.Zone != zone {
-			t.Errorf("zone %v", rep.Zone)
-		}
-	})
-	t.Run("delegated subdomain", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		sub := dnstest.NewZone(t, "sub.example.com.", 257)
-		srv.Signed(t, sub, now, true)
-		rep := runCheck(t, testConfig(srv, true), "sub.example.com")
-		wantStatus(t, rep, Secure)
-		if *rep.Zone != "sub.example.com." {
-			t.Errorf("zone %v", *rep.Zone)
+	t.Run("data queries use CD=1", func(t *testing.T) {
+		f := chain(t)
+		f.run(t, zone)
+		if f.srv.Hits("udp", zone, dns.TypeDNSKEY, true) != 1 || f.srv.Hits("udp", zone, dns.TypeDNSKEY, false) != 0 {
+			t.Error("DNSKEY was not queried with CD=1 only")
 		}
 	})
 }
 
 func TestAliases(t *testing.T) {
 	t.Run("alias to another zone", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		srv.Set("www.example.com.", dns.TypeSOA, dnstest.Reply{AD: true,
+		f := chain(t)
+		f.srv.Set("www.example.com.", dns.TypeSOA, dnstest.Reply{
 			Answer: []dns.RR{dnstest.RR(t, "www.example.com. 300 IN CNAME www.example.net.")},
-			Ns:     []dns.RR{dnstest.ParentSOA(t, "example.net.")},
+			Ns:     []dns.RR{dnstest.RR(t, "example.net. 900 IN SOA ns1.example.net. h.example.net. 1 1 1 1 1")},
 		})
-		rep := runCheck(t, testConfig(srv, true), "www.example.com")
-		if *rep.Zone != zone || !slices.Equal(rep.Records.AliasChain, []string{"www.example.net."}) || !*rep.NameExists {
-			t.Errorf("zone %v, alias %v", *rep.Zone, rep.Records.AliasChain)
-		}
+		rep := f.run(t, "www.example.com")
 		wantStatus(t, rep, Secure)
+		if *rep.Zone != zone || !slices.Equal(rep.AliasChain, []string{"www.example.net."}) || !*rep.NameExists {
+			t.Errorf("zone %v, alias %v", *rep.Zone, rep.AliasChain)
+		}
 	})
 	t.Run("alias loop", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		srv.Set("a.example.com.", dns.TypeSOA, dnstest.Reply{Answer: []dns.RR{
+		f := chain(t)
+		f.srv.Set("a.example.com.", dns.TypeSOA, dnstest.Reply{Answer: []dns.RR{
 			dnstest.RR(t, "a.example.com. 300 IN CNAME b.example.com."),
 			dnstest.RR(t, "b.example.com. 300 IN CNAME a.example.com."),
 		}})
-		rep := runCheck(t, testConfig(srv, true), "a.example.com")
-		if *rep.Zone != zone || len(rep.Records.AliasChain) != 1 {
-			t.Errorf("zone %v, alias %v", *rep.Zone, rep.Records.AliasChain)
-		}
-		if !slices.ContainsFunc(rep.Warnings, func(w string) bool { return strings.Contains(w, "alias loop") }) {
-			t.Errorf("warnings %v", rep.Warnings)
+		rep := f.run(t, "a.example.com")
+		if *rep.Zone != zone || len(rep.AliasChain) != 1 || !slices.ContainsFunc(rep.Warnings, func(w string) bool { return strings.Contains(w, "alias loop") }) {
+			t.Errorf("zone %v, alias %v, warnings %v", *rep.Zone, rep.AliasChain, rep.Warnings)
 		}
 	})
 	t.Run("long alias chain is cut at the limit", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		var chain []dns.RR
-		for i := 0; i < 12; i++ {
-			chain = append(chain, dnstest.RR(t, string(rune('a'+i))+".example.com. 300 IN CNAME "+string(rune('a'+i+1))+".example.com."))
+		f := chain(t)
+		var c []dns.RR
+		for i := range 12 {
+			c = append(c, dnstest.RR(t, fmt.Sprintf("a%d.example.com. 300 IN CNAME a%d.example.com.", i, i+1)))
 		}
-		srv.Set("a.example.com.", dns.TypeSOA, dnstest.Reply{Answer: chain})
-		rep := runCheck(t, testConfig(srv, true), "a.example.com")
-		if len(rep.Records.AliasChain) != maxAliases {
-			t.Errorf("alias chain %v", rep.Records.AliasChain)
+		f.srv.Set("a0.example.com.", dns.TypeSOA, dnstest.Reply{Answer: c})
+		if rep := f.run(t, "a0.example.com"); len(rep.AliasChain) != maxAliases {
+			t.Errorf("alias chain %v", rep.AliasChain)
 		}
 	})
 }
 
 func TestFailuresKeepPartialReport(t *testing.T) {
 	t.Run("REFUSED everywhere", func(t *testing.T) {
-		rep := runCheck(t, testConfig(dnstest.Start(t), true), zone)
+		f := fixture{srv: dnstest.Start(t), root: dnstest.NewZone(t, ".", now, 257)}
+		rep := f.run(t, zone)
 		wantStatus(t, rep, Indeterminate)
-		if rep.Zone != nil || len(rep.Errors) == 0 || len(rep.Queries) == 0 {
+		if rep.Zone != nil || len(rep.Errors) == 0 {
 			t.Errorf("zone %v, errors %v", rep.Zone, rep.Errors)
 		}
 	})
 	t.Run("DS query times out", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		srv.Set(zone, dns.TypeDS, dnstest.Reply{Drop: -1})
-		rep := runCheck(t, testConfig(srv, true), zone)
-		wantStatus(t, rep, Indeterminate)
-		// A timeout must not look like a missing DS.
-		wantChecks(t, rep, map[string]Result{"ds.match": Unknown, "dnskey.signatures": Pass})
-		if rep.Records.DS != nil || len(rep.Errors) != 1 || len(rep.Records.DNSKEY) != 2 {
-			t.Errorf("DS %v, errors %v", rep.Records.DS, rep.Errors)
-		}
+		f := chain(t)
+		f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Drop: -1})
+		rep := f.run(t, zone)
+		wantStatus(t, rep, Indeterminate) // a timeout must not look like a missing DS
+		wantChain(t, rep, ".:ok", "com.:ok", "example.com.:error")
 	})
-	t.Run("DNSKEY query times out", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Drop: -1})
-		rep := runCheck(t, testConfig(srv, true), zone)
+	t.Run("SERVFAIL even with CD=1", func(t *testing.T) {
+		f := chain(t)
+		f.srv.Set(zone, dns.TypeDNSKEY, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+		rep := f.run(t, zone)
 		wantStatus(t, rep, Indeterminate)
-		wantChecks(t, rep, map[string]Result{"dnskey.present": Unknown, "ds.match": Unknown})
+		wantChain(t, rep, ".:ok", "com.:ok", "example.com.:error")
 	})
 	t.Run("interrupted", func(t *testing.T) {
-		srv, _ := signed(t, true)
+		f := chain(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		rep, err := Run(ctx, testConfig(srv, true), zone)
-		if err != nil {
-			t.Fatal(err)
-		}
+		rep, _ := Run(ctx, f.config(), zone)
 		wantStatus(t, rep, Indeterminate)
 		if !slices.ContainsFunc(rep.Errors, func(e string) bool { return strings.Contains(e, "partial") }) {
 			t.Errorf("errors %v", rep.Errors)
 		}
 	})
 	t.Run("deadline", func(t *testing.T) {
-		srv := dnstest.Start(t)
-		srv.Set(zone, dns.TypeSOA, dnstest.Reply{Drop: -1})
-		cfg := testConfig(srv, true)
+		f := chain(t)
+		f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{Drop: -1})
+		cfg := f.config()
 		cfg.Timeout = 5 * time.Second
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 		defer cancel()
@@ -490,38 +461,88 @@ func TestFailuresKeepPartialReport(t *testing.T) {
 		wantStatus(t, rep, Indeterminate)
 	})
 	t.Run("query limit", func(t *testing.T) {
-		srv, _ := signed(t, true)
-		cfg := testConfig(srv, true)
+		f := chain(t)
+		cfg := f.config()
 		cfg.MaxQueries = 3
-		rep := runCheck(t, cfg, zone)
+		rep, _ := Run(context.Background(), cfg, zone)
 		wantStatus(t, rep, Indeterminate)
-		if len(rep.Queries) != 5 || !strings.Contains(rep.Errors[len(rep.Errors)-1], "query limit") {
-			t.Errorf("queries %d, errors %v", len(rep.Queries), rep.Errors)
+		if !slices.ContainsFunc(rep.Errors, func(e string) bool { return strings.Contains(e, "query limit") }) {
+			t.Errorf("errors %v", rep.Errors)
 		}
 	})
 }
 
 func TestExpiryWarning(t *testing.T) {
-	srv, z := signed(t, true)
-	soa := []dns.RR{z.SOA(t)}
-	soon := z.Sign(t, 1, soa, now.Add(-time.Hour), now.Add(48*time.Hour))
-	srv.Set(zone, dns.TypeSOA, dnstest.Reply{AD: true, Answer: append(soa, soon)})
-	rep := runCheck(t, testConfig(srv, true), zone)
+	soaWith := func(t *testing.T, from, until time.Time) *Report {
+		f := chain(t)
+		soa := []dns.RR{f.example.SOA(t)}
+		f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{AD: true, Answer: append(soa, f.example.Sign(t, 1, soa, from, until))})
+		return f.run(t, zone)
+	}
+	rep := soaWith(t, now.Add(-28*24*time.Hour), now.Add(48*time.Hour))
 	wantStatus(t, rep, Secure) // a warning alone does not change the status
-	wantChecks(t, rep, map[string]Result{"signatures.expiry": Warn, "soa.signatures": Pass})
-	if len(rep.Warnings) != 1 {
+	if len(rep.Warnings) != 1 || !strings.Contains(rep.Warnings[0], "SOA signature of example.com.") {
 		t.Errorf("warnings %v", rep.Warnings)
 	}
-
-	// A later valid signature covers for the one that expires soon.
-	later := z.Sign(t, 1, soa, now.Add(-time.Hour), now.Add(720*time.Hour))
-	srv.Set(zone, dns.TypeSOA, dnstest.Reply{AD: true, Answer: append(soa, soon, later)})
-	rep = runCheck(t, testConfig(srv, true), zone)
-	wantChecks(t, rep, map[string]Result{"signatures.expiry": Pass})
+	// An online signer issues short-lived signatures on every answer; no warning.
+	if rep := soaWith(t, now.Add(-time.Hour), now.Add(24*time.Hour)); len(rep.Warnings) != 0 {
+		t.Errorf("online signer: warnings %v", rep.Warnings)
+	}
 }
 
-func TestRunRejectsInvalidDomain(t *testing.T) {
-	if _, err := Run(context.Background(), Config{}, "http://example.com"); err == nil {
-		t.Error("want error")
+func TestDenyDS(t *testing.T) {
+	z := dnstest.NewZone(t, zone, now, 257)
+	keys := z.Keys
+	msg := func(rrs ...dns.RR) *dns.Msg {
+		m := new(dns.Msg)
+		for _, rr := range rrs {
+			m.Ns = append(m.Ns, z.Signed(t, rr)...)
+		}
+		return m
+	}
+	nsec := func(owner, next, types string) dns.RR {
+		return dnstest.RR(t, owner+" 3600 IN NSEC "+next+" "+types)
+	}
+	tests := []struct {
+		name string
+		m    *dns.Msg
+		want denial
+	}{
+		{"NSEC delegation without DS", msg(nsec("sub.example.com.", "z.example.com.", "NS RRSIG NSEC")), insecureDelegation},
+		{"NSEC with DS bit", msg(nsec("sub.example.com.", "z.example.com.", "NS DS RRSIG NSEC")), noProof},
+		{"NSEC without NS", msg(nsec("sub.example.com.", "z.example.com.", "A RRSIG NSEC")), notDelegation},
+		{"NSEC with SOA comes from the child", msg(nsec("sub.example.com.", "z.example.com.", "NS SOA RRSIG NSEC")), noProof},
+		{"empty non-terminal", msg(nsec("a.example.com.", "x.sub.example.com.", "A RRSIG NSEC")), notDelegation},
+		{"NSEC that covers a different name", msg(nsec("x.example.com.", "z.example.com.", "A RRSIG NSEC")), noProof},
+		{"NSEC owned after the name", msg(nsec("t.example.com.", "x.sub.example.com.", "A RRSIG NSEC")), noProof},
+		{"NSEC3 match without DS", msg(nsec3(zone, hashOf("sub.example.com."), maxHash, 0, dns.TypeNS)), insecureDelegation},
+		{"NSEC3 match with DS", msg(nsec3(zone, hashOf("sub.example.com."), maxHash, 0, dns.TypeNS, dns.TypeDS)), noProof},
+		{"NSEC3 opt-out", msg(
+			nsec3(zone, hashOf(zone), maxHash, 0, dns.TypeNS, dns.TypeSOA),
+			nsec3(zone, "00000000000000000000000000000000", maxHash, 1),
+		), insecureDelegation},
+		{"NSEC3 opt-out span without closest encloser", msg(nsec3(zone, "00000000000000000000000000000000", maxHash, 1)), noProof},
+		{"nothing", new(dns.Msg), noProof},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _, _ := denyDS(tt.m, "sub.example.com.", zone, keys, now); got != tt.want {
+				t.Errorf("denyDS = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// hashOf is the NSEC3 hash of name with SHA-1, no iterations and no salt.
+func hashOf(name string) string { return dns.HashName(name, dns.SHA1, 0, "") }
+
+const maxHash = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+
+// nsec3 builds an NSEC3 record of zone z. ownerHash and next are base32hex hashes; flags
+// bit 1 is opt-out.
+func nsec3(z, ownerHash, next string, flags uint8, types ...uint16) dns.RR {
+	return &dns.NSEC3{
+		Hdr:  dns.RR_Header{Name: strings.ToLower(ownerHash) + "." + z, Rrtype: dns.TypeNSEC3, Class: dns.ClassINET, Ttl: 3600},
+		Hash: dns.SHA1, Flags: flags, HashLength: 20, NextDomain: next, TypeBitMap: types,
 	}
 }

@@ -1,13 +1,11 @@
-// Package checker diagnoses the DNSSEC configuration of the zone that contains one name.
-// Chain validation is delegated to the resolver; local checks are diagnostics only.
+// Package checker validates the DNSSEC chain of trust of the zone that contains one name,
+// locally, from the IANA root trust anchor down (RFC 4033-4035, RFC 5155).
 package checker
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"regexp"
 	"slices"
@@ -18,20 +16,41 @@ import (
 	"golang.org/x/net/idna"
 )
 
-const (
-	modeTrusted   = "trusted-resolver"
-	modeUntrusted = "untrusted-resolver"
-	maxAliases    = 8
-)
+const maxAliases = 8
+
+// RootAnchors are the root zone trust anchors published by IANA in
+// https://data.iana.org/root-anchors/root-anchors.xml (KSK-2017 and KSK-2024).
+var RootAnchors = []*dns.DS{
+	mustDS(". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"),
+	mustDS(". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"),
+}
+
+func mustDS(s string) *dns.DS {
+	rr, err := dns.NewRR(s)
+	if err != nil {
+		panic(err)
+	}
+	return rr.(*dns.DS)
+}
 
 type Config struct {
 	Resolver   string // host:port, see ParseResolver
-	Trusted    bool   // the user trusts the resolver's validation and the path to it
 	Timeout    time.Duration
 	WarnExpiry time.Duration
 	Now        func() time.Time // clock for signature validity; time.Now when nil
 	MaxQueries int              // packets per run; maxQueries when 0
+	Anchors    []*dns.DS        // root trust anchors; RootAnchors when nil
 }
+
+// Algorithms and DS digest types this tool validates (RFC 8624). A zone whose DS
+// records use none of them is treated as insecure (RFC 4035 section 5.2).
+var (
+	supportedAlg = map[uint8]bool{
+		dns.RSASHA1: true, dns.RSASHA1NSEC3SHA1: true, dns.RSASHA256: true, dns.RSASHA512: true,
+		dns.ECDSAP256SHA256: true, dns.ECDSAP384SHA384: true, dns.ED25519: true,
+	}
+	supportedDigest = map[uint8]bool{dns.SHA1: true, dns.SHA256: true, dns.SHA384: true}
+)
 
 var (
 	labelRE = regexp.MustCompile(`^[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?$`)
@@ -94,164 +113,387 @@ func Run(ctx context.Context, cfg Config, domain string) (*Report, error) {
 	if cfg.MaxQueries == 0 {
 		cfg.MaxQueries = maxQueries
 	}
+	if cfg.Anchors == nil {
+		cfg.Anchors = RootAnchors
+	}
 	start := time.Now()
 	r := &run{
+		cfg: cfg,
 		c:   &client{server: cfg.Resolver, timeout: cfg.Timeout, maxQueries: cfg.MaxQueries},
 		now: cfg.Now().UTC(),
 		rep: &Report{
-			SchemaVersion: 1, Domain: domain, NormalizedDomain: name, Resolver: cfg.Resolver,
-			ValidationMode: modeUntrusted, Status: Indeterminate,
-			Records: Records{AliasChain: []string{}}, Queries: []Query{}, Checks: []Check{},
-			Warnings: []string{}, Errors: []string{},
+			SchemaVersion: 2, Domain: domain, NormalizedDomain: name, Status: Indeterminate,
+			AliasChain: []string{}, Chain: []Step{}, Resolver: Resolver{Address: cfg.Resolver},
+			Queries: []Query{}, Warnings: []string{}, Errors: []string{},
 		},
 	}
 	r.rep.CheckedAt = r.now.Format(time.RFC3339)
-	if cfg.Trusted {
-		r.rep.ValidationMode = modeTrusted
+	if zone := r.findZone(ctx, name); zone == "" {
+		r.rep.Summary = "The zone of " + name + " could not be determined, so DNSSEC could not be checked."
+	} else {
+		r.rep.Zone = &zone
+		r.rep.Status, r.rep.Summary = r.validate(ctx, zone)
+		r.nameServers(ctx, zone)
+		r.resolverView(ctx, zone)
 	}
-	r.check(ctx, cfg, name)
 	if ctx.Err() != nil {
 		r.rep.Errors = append(r.rep.Errors, fmt.Sprintf("run stopped early (%v); the report is partial", ctx.Err()))
 	}
+	r.rep.DNSSEC = statuses[r.rep.Status].verdict
 	r.rep.DurationMS = time.Since(start).Milliseconds()
 	return r.rep, nil
 }
 
 type run struct {
+	cfg Config
 	c   *client
 	now time.Time
 	rep *Report
 }
 
-func (r *run) check(ctx context.Context, cfg Config, name string) {
-	rep := r.rep
-	zone := r.findZone(ctx, name)
-	if zone == "" {
-		rep.Summary = "The zone of " + name + " could not be determined; no DNSSEC status can be given."
-		return
+// q sends a CD=1 query, so that the resolver passes data through even when its own
+// validation fails; all validation is done here. It returns nil unless the answer is
+// NOERROR or NXDOMAIN.
+func (r *run) q(ctx context.Context, name string, qtype uint16) *dns.Msg {
+	q := r.record(r.c.query(ctx, name, qtype, true))
+	if q.msg != nil && q.msg.Rcode != dns.RcodeSuccess && q.msg.Rcode != dns.RcodeNameError {
+		r.rep.Errors = append(r.rep.Errors, fmt.Sprintf("%s %s: the resolver answered %s", name, q.Type, q.Response.Rcode))
+		return nil
 	}
-	rep.Zone = &zone
-	root := zone == "."
-
-	soaR, soaM := r.ask(ctx, zone, dns.TypeSOA)
-	keyR, keyM := r.ask(ctx, zone, dns.TypeDNSKEY)
-	_, nsM := r.ask(ctx, zone, dns.TypeNS)
-	var dsR *Response
-	var dsM *dns.Msg
-	if !root {
-		dsR, dsM = r.ask(ctx, zone, dns.TypeDS)
-	}
-
-	if ns := answers[*dns.NS](nsM, zone); ns != nil {
-		rep.Records.NS = []string{}
-		for _, n := range ns {
-			rep.Records.NS = append(rep.Records.NS, strings.ToLower(n.Ns))
-		}
-		slices.Sort(rep.Records.NS)
-	}
-	keys := answers[*dns.DNSKEY](keyM, zone)
-	if keys != nil {
-		rep.Records.DNSKEY = []DNSKEY{}
-		for _, k := range keys {
-			rep.Records.DNSKEY = append(rep.Records.DNSKEY, DNSKEY{k.KeyTag(), k.Algorithm, k.Flags, k.Protocol})
-		}
-		slices.SortFunc(rep.Records.DNSKEY, func(a, b DNSKEY) int {
-			return cmp.Or(cmp.Compare(a.KeyTag, b.KeyTag), cmp.Compare(a.Flags, b.Flags), cmp.Compare(a.Algorithm, b.Algorithm))
-		})
-	}
-	dss := answers[*dns.DS](dsM, zone)
-	dsCheck, dsRecs, anchors := checkDS(root, dss, keys)
-	rep.Records.DS = dsRecs
-	keyCheck, keySigs := checkSigs("dnskey.signatures", zone, dns.TypeDNSKEY, keyM, keys, anchors, r.now)
-	soaCheck, soaSigs := checkSigs("soa.signatures", zone, dns.TypeSOA, soaM, keys, nil, r.now)
-	if keySigs != nil || soaSigs != nil {
-		rep.Records.RRSIG = append(append([]RRSIG{}, keySigs...), soaSigs...)
-	}
-	expiry := checkExpiry(rep.Records.RRSIG, cfg.WarnExpiry, r.now)
-	if expiry.Result == Warn {
-		rep.Warnings = append(rep.Warnings, expiry.Evidence)
-	}
-	rep.Checks = []Check{
-		checkResolver(cfg.Trusted, soaR, keyR),
-		dsCheck,
-		checkKeysPresent(keyM, keys, dss),
-		keyCheck,
-		soaCheck,
-		expiry,
-	}
-
-	f := facts{
-		trusted: cfg.Trusted, root: root,
-		soa: soaR, dnskey: keyR, ds: dsR,
-		delegation: len(answers[*dns.SOA](soaM, zone)) > 0 && len(rep.Records.NS) > 0,
-		dsNoData:   isNoData(dsM, zone),
-		dsMatch:    dsCheck.Result, dnskeySigs: keyCheck.Result, soaSigs: soaCheck.Result,
-	}
-	rep.Status, rep.Summary = classify(f)
-	if rep.Status == Insecure && len(keys) > 0 {
-		rep.Warnings = append(rep.Warnings, "the zone publishes DNSKEY records but the parent has no DS for it: possible island of trust; its signatures are not trusted by validators")
-	}
-}
-
-// ask sends a CD=0 query. On SERVFAIL it repeats the query with CD=1 to collect
-// diagnostic data. The returned Response is always the CD=0 one: a CD=1 answer never
-// counts as validation by the resolver.
-func (r *run) ask(ctx context.Context, name string, qtype uint16) (*Response, *dns.Msg) {
-	q := r.record(r.c.query(ctx, name, qtype, false))
-	if q.Response == nil || q.msg.Rcode != dns.RcodeServerFailure {
-		return q.Response, q.msg
-	}
-	d := r.record(r.c.query(ctx, name, qtype, true))
-	if d.msg == nil || (d.msg.Rcode != dns.RcodeSuccess && d.msg.Rcode != dns.RcodeNameError) {
-		return q.Response, nil
-	}
-	if w := fmt.Sprintf("SERVFAIL for %s %s; records shown for it come from a CD=1 query and were not validated by the resolver", name, q.Type); !slices.Contains(r.rep.Warnings, w) {
-		r.rep.Warnings = append(r.rep.Warnings, w)
-	}
-	return q.Response, d.msg
+	return q.msg
 }
 
 func (r *run) record(q Query) Query {
 	r.rep.Queries = append(r.rep.Queries, q)
 	if q.Error != "" {
-		r.rep.Errors = append(r.rep.Errors, fmt.Sprintf("%s %s (CD=%d): %s", q.Name, q.Type, b2i(q.CD), q.Error))
+		r.rep.Errors = append(r.rep.Errors, fmt.Sprintf("%s %s: %s", q.Name, q.Type, q.Error))
 	}
-	if q.msg != nil {
-		for _, rr := range slices.Concat(q.msg.Answer, q.msg.Ns) {
-			switch rr.Header().Rrtype {
-			case dns.TypeNSEC:
-				r.rep.Records.NSEC = true
-			case dns.TypeNSEC3:
-				r.rep.Records.NSEC3 = true
+	return q
+}
+
+func (r *run) step(zone, result, detail string, records []string) {
+	if records == nil {
+		records = []string{}
+	}
+	r.rep.Chain = append(r.rep.Chain, Step{zone, result, detail, records})
+}
+
+// validate walks from the root to zone. At every label it asks for DS: a validly signed
+// DS leads to the child's DNSKEY set; a signed NSEC/NSEC3 proof shows either that the
+// label is not a delegation (keep walking) or an insecure delegation (stop).
+func (r *run) validate(ctx context.Context, zone string) (Status, string) {
+	keys, st, why := r.zoneKeys(ctx, ".", "", r.cfg.Anchors, nil)
+	if st != "" {
+		return st, why
+	}
+	cur := "."
+	labels := dns.SplitDomainName(zone)
+	for i := len(labels) - 1; i >= 0; i-- {
+		name := dns.Fqdn(strings.Join(labels[i:], "."))
+		m := r.q(ctx, name, dns.TypeDS)
+		if m == nil {
+			r.step(name, StepError, "no usable answer to the DS query", nil)
+			return Indeterminate, "The DS query for " + name + " failed, so the chain of trust could not be followed."
+		}
+		if dss := answers[*dns.DS](m, name); len(dss) > 0 {
+			_, sig, why := verify(m.Answer, name, dns.TypeDS, cur, keys, r.now)
+			ev := rrLines(dss)
+			if sig == nil {
+				r.step(name, StepFail, "DS in "+cur+" is not validly signed: "+why, ev)
+				return Bogus, fmt.Sprintf("The DS record of %s in %s is not validly signed (%s), so DNSSEC validation fails.", name, cur, why)
+			}
+			if keys, st, why = r.zoneKeys(ctx, name, cur, dss, append(ev, sigLine(sig))); st != "" {
+				return st, why
+			}
+			cur = name
+			continue
+		}
+		switch kind, proof, ev := denyDS(m, name, cur, keys, r.now); kind {
+		case notDelegation:
+			continue
+		case insecureDelegation:
+			r.step(name, StepInsecure, "no DS in "+cur+"; the absence is proven by a signed "+proof+" record", ev)
+			if name == zone {
+				return Insecure, fmt.Sprintf("%s is not signed: its parent %s proves with a signed record that there is no DS for it.", zone, cur)
+			}
+			return Insecure, fmt.Sprintf("%s is not protected by DNSSEC: it is below %s, which is not signed (%s proves there is no DS for it).", zone, name, cur)
+		default:
+			r.step(name, StepFail, "no DS in "+cur+" and no valid signed proof that it is absent", ev)
+			return Bogus, fmt.Sprintf("%s is signed, but it neither has a DS record for %s nor a valid signed proof that there is none.", cur, name)
+		}
+	}
+	if cur != zone {
+		r.step(zone, StepFail, "the parent zone "+cur+" proves that "+zone+" is not a delegation", nil)
+		return Bogus, fmt.Sprintf("%s has an SOA record, but its signed parent %s proves it is not a delegation.", zone, cur)
+	}
+	m := r.q(ctx, zone, dns.TypeSOA)
+	if m == nil {
+		r.step(zone, StepError, "no usable answer to the SOA query", nil)
+		return Indeterminate, "The SOA query for " + zone + " failed."
+	}
+	set, sig, why := verify(m.Answer, zone, dns.TypeSOA, zone, keys, r.now)
+	ev := rrLines(set)
+	if sig == nil {
+		r.step(zone, StepFail, "SOA is not validly signed: "+why, ev)
+		return Bogus, fmt.Sprintf("The SOA record of %s is not validly signed (%s), so DNSSEC validation fails.", zone, why)
+	}
+	r.step(zone, StepOK, fmt.Sprintf("SOA signed by key %d, valid until %s", sig.KeyTag, ts(sig.Expiration)), append(ev, sigLine(sig)))
+	r.warnExpiry(zone, sig)
+	return Secure, fmt.Sprintf("DNSSEC is enabled and valid: every link from the IANA root key to the SOA record of %s verifies.", zone)
+}
+
+// zoneKeys fetches the DNSKEY set of zone and checks it against the DS records (or the
+// trust anchors for the root): a DNSKEY must match a DS by algorithm, key tag and digest,
+// and that key must sign the DNSKEY set. It returns the zone's keys, now trusted.
+func (r *run) zoneKeys(ctx context.Context, zone, parentZone string, dss []*dns.DS, ev []string) ([]*dns.DNSKEY, Status, string) {
+	from := "DS"
+	if zone == "." {
+		from = "trust anchor"
+	}
+	usable := slices.DeleteFunc(slices.Clone(dss), func(d *dns.DS) bool {
+		return !supportedAlg[d.Algorithm] || !supportedDigest[d.DigestType]
+	})
+	if len(usable) == 0 {
+		r.step(zone, StepInsecure, "every DS uses an algorithm or digest type this tool cannot validate; treated as insecure (RFC 4035 section 5.2)", ev)
+		return nil, Insecure, fmt.Sprintf("%s uses only DNSSEC algorithms or digest types this tool does not support; validators treat such zones as insecure.", zone)
+	}
+	m := r.q(ctx, zone, dns.TypeDNSKEY)
+	if m == nil {
+		r.step(zone, StepError, "no usable answer to the DNSKEY query", ev)
+		return nil, Indeterminate, "The DNSKEY query for " + zone + " failed, so the chain of trust could not be followed."
+	}
+	if zone == "." && !slices.ContainsFunc(m.Answer, func(rr dns.RR) bool { return rr.Header().Rrtype == dns.TypeRRSIG }) {
+		r.step(zone, StepError, "the resolver returned no RRSIG records", nil)
+		return nil, Indeterminate, "The resolver does not pass DNSSEC records (no RRSIG for the root DNSKEY set); use another resolver with --resolver."
+	}
+	all := answers[*dns.DNSKEY](m, zone)
+	for _, k := range all {
+		ev = append(ev, keyLine(k))
+	}
+	if len(all) == 0 {
+		r.step(zone, StepFail, "the parent has a DS record, but the zone publishes no DNSKEY", ev)
+		return nil, Bogus, fmt.Sprintf("%s has a DS record in its parent but publishes no DNSKEY, so DNSSEC validation fails.", zone)
+	}
+	var matched []*dns.DNSKEY
+	for _, d := range usable {
+		for _, k := range all {
+			if isZoneKey(k) && k.Algorithm == d.Algorithm && k.KeyTag() == d.KeyTag && strings.EqualFold(k.ToDS(d.DigestType).Digest, d.Digest) {
+				matched = append(matched, k)
 			}
 		}
 	}
-	return q
+	if len(matched) == 0 {
+		r.step(zone, StepFail, "no DNSKEY matches the "+from+" records (key tag "+tags(usable)+")", ev)
+		return nil, Bogus, fmt.Sprintf("No DNSKEY of %s matches its %s records (key tag %s), so DNSSEC validation fails. A DS left over from a key rollover is a common cause.", zone, from, tags(usable))
+	}
+	_, sig, why := verify(m.Answer, zone, dns.TypeDNSKEY, zone, matched, r.now)
+	if sig == nil {
+		r.step(zone, StepFail, "the DNSKEY set is not validly signed by the key the "+from+" points to: "+why, ev)
+		return nil, Bogus, fmt.Sprintf("The DNSKEY set of %s is not validly signed by the key its %s points to (%s), so DNSSEC validation fails.", zone, from, why)
+	}
+	detail := fmt.Sprintf("DS %d in %s → DNSKEY %d; DNSKEY set signed by key %d", sig.KeyTag, parentZone, sig.KeyTag, sig.KeyTag)
+	if zone == "." {
+		detail = fmt.Sprintf("DNSKEY %d matches the IANA root trust anchor; DNSKEY set signed by key %d", sig.KeyTag, sig.KeyTag)
+	}
+	r.step(zone, StepOK, detail, append(ev, sigLine(sig)))
+	r.warnExpiry(zone, sig)
+	return slices.DeleteFunc(all, func(k *dns.DNSKEY) bool { return !isZoneKey(k) }), "", ""
+}
+
+// verify returns the owner/t RRset from rrs and an RRSIG over it that is made by signer
+// with one of keys, cryptographically valid and current. On failure sig is nil and why
+// says what was wrong.
+func verify(rrs []dns.RR, owner string, t uint16, signer string, keys []*dns.DNSKEY, now time.Time) (set []dns.RR, sig *dns.RRSIG, why string) {
+	name := dns.TypeToString[t]
+	var sigs []*dns.RRSIG
+	for _, rr := range rrs {
+		if !strings.EqualFold(rr.Header().Name, owner) {
+			continue
+		}
+		if rr.Header().Rrtype == t {
+			set = append(set, rr)
+		} else if s, ok := rr.(*dns.RRSIG); ok && s.TypeCovered == t {
+			sigs = append(sigs, s)
+		}
+	}
+	switch {
+	case len(set) == 0:
+		return nil, nil, "no " + name + " records"
+	case len(sigs) == 0:
+		return set, nil, "no RRSIG covers the " + name + " records"
+	}
+	why = "no trusted key with the RRSIG's key tag"
+	for _, s := range sigs {
+		if !strings.EqualFold(s.SignerName, signer) {
+			why = fmt.Sprintf("signed by %s instead of %s", s.SignerName, signer)
+			continue
+		}
+		for _, k := range keys {
+			if k.KeyTag() != s.KeyTag || k.Algorithm != s.Algorithm {
+				continue
+			}
+			switch err := s.Verify(k, set); {
+			case err != nil:
+				why = fmt.Sprintf("signature by key %d does not verify (%v)", s.KeyTag, err)
+			case !s.ValidityPeriod(now):
+				why = fmt.Sprintf("signature by key %d is valid only from %s to %s", s.KeyTag, ts(s.Inception), ts(s.Expiration))
+			default:
+				return set, s, ""
+			}
+		}
+	}
+	return set, nil, why
+}
+
+type denial int
+
+const (
+	noProof denial = iota
+	notDelegation
+	insecureDelegation
+)
+
+// denyDS checks a DS answer without DS records for a proof, signed by zone, that name has
+// no DS: an NSEC or NSEC3 record at name (RFC 4035 section 5.4, RFC 5155 section 8.5),
+// an NSEC that shows name is an empty non-terminal, or an NSEC3 opt-out span (RFC 5155
+// section 8.6). The proof also tells whether name is a delegation at all. proof names
+// the record type that proved it.
+func denyDS(m *dns.Msg, name, zone string, keys []*dns.DNSKEY, now time.Time) (kind denial, proof string, ev []string) {
+	var nsec []*dns.NSEC
+	var nsec3 []*dns.NSEC3
+	for _, rr := range m.Ns {
+		owner, t := rr.Header().Name, rr.Header().Rrtype
+		if t != dns.TypeNSEC && t != dns.TypeNSEC3 {
+			continue
+		}
+		if t == dns.TypeNSEC3 && !strings.EqualFold(parent(owner), zone) {
+			continue
+		}
+		if _, sig, _ := verify(m.Ns, owner, t, zone, keys, now); sig != nil {
+			ev = append(ev, rrLine(rr), sigLine(sig))
+			if n, ok := rr.(*dns.NSEC); ok {
+				nsec = append(nsec, n)
+			} else {
+				nsec3 = append(nsec3, rr.(*dns.NSEC3))
+			}
+		}
+	}
+	byBitmap := func(types []uint16) denial {
+		switch {
+		case slices.Contains(types, dns.TypeDS):
+			return noProof
+		case slices.Contains(types, dns.TypeNS) && !slices.Contains(types, dns.TypeSOA):
+			return insecureDelegation
+		case !slices.Contains(types, dns.TypeNS):
+			return notDelegation
+		}
+		return noProof // SOA at name: the answer came from the child, not the parent
+	}
+	for _, n := range nsec {
+		if strings.EqualFold(n.Hdr.Name, name) {
+			return byBitmap(n.TypeBitMap), "NSEC", ev
+		}
+		if canonicalLess(n.Hdr.Name, name) && dns.IsSubDomain(name, n.NextDomain) && !strings.EqualFold(n.NextDomain, name) {
+			return notDelegation, "NSEC", ev // empty non-terminal: the next name is below name
+		}
+	}
+	for _, n := range nsec3 {
+		if n.Match(name) {
+			return byBitmap(n.TypeBitMap), "NSEC3", ev
+		}
+	}
+	next := name
+	for ce := parent(name); dns.IsSubDomain(zone, ce); next, ce = ce, parent(ce) {
+		if slices.ContainsFunc(nsec3, func(n *dns.NSEC3) bool { return n.Match(ce) }) {
+			if slices.ContainsFunc(nsec3, func(n *dns.NSEC3) bool { return n.Flags&1 == 1 && n.Cover(next) }) {
+				return insecureDelegation, "NSEC3 opt-out (RFC 5155)", ev
+			}
+			break
+		}
+		if strings.EqualFold(ce, zone) {
+			break
+		}
+	}
+	return noProof, "", ev
+}
+
+// canonicalLess orders names as in RFC 4034 section 6.1: label by label from the right.
+func canonicalLess(a, b string) bool {
+	la, lb := dns.SplitDomainName(strings.ToLower(a)), dns.SplitDomainName(strings.ToLower(b))
+	for i := 1; i <= len(la) && i <= len(lb); i++ {
+		if c := strings.Compare(la[len(la)-i], lb[len(lb)-i]); c != 0 {
+			return c < 0
+		}
+	}
+	return len(la) < len(lb)
+}
+
+// warnExpiry warns about a signature that expires within --warn-expiry and in less than
+// a quarter of its validity period. The second condition keeps online signers, which
+// issue short-lived signatures on every answer, from always warning.
+func (r *run) warnExpiry(zone string, s *dns.RRSIG) {
+	inc, exp := sigTime(s.Inception), sigTime(s.Expiration)
+	if left := exp.Sub(r.now); left < r.cfg.WarnExpiry && left < exp.Sub(inc)/4 {
+		r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the %s signature of %s (key %d) expires in %s, at %s",
+			dns.TypeToString[s.TypeCovered], zone, s.KeyTag, left.Round(time.Minute), ts(s.Expiration)))
+	}
+}
+
+func (r *run) nameServers(ctx context.Context, zone string) {
+	if ns := answers[*dns.NS](r.q(ctx, zone, dns.TypeNS), zone); ns != nil {
+		r.rep.NS = []string{}
+		for _, n := range ns {
+			r.rep.NS = append(r.rep.NS, strings.ToLower(n.Ns))
+		}
+		slices.Sort(r.rep.NS)
+	}
+}
+
+// resolverView records the resolver's own validation (CD=0) of the zone SOA. It is only
+// compared with the local result and never changes it.
+func (r *run) resolverView(ctx context.Context, zone string) {
+	q := r.record(r.c.query(ctx, zone, dns.TypeSOA, false))
+	r.rep.Resolver.Response = q.Response
+	if q.Response == nil {
+		return
+	}
+	var agrees bool
+	switch r.rep.Status {
+	case Secure:
+		agrees = q.Response.AD
+	case Insecure:
+		agrees = !q.Response.AD && q.Response.Rcode != "SERVFAIL"
+	case Bogus:
+		agrees = q.Response.Rcode == "SERVFAIL"
+	default:
+		return
+	}
+	r.rep.Resolver.Agrees = &agrees
+	if !agrees {
+		r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the resolver's own answer (%s, AD=%d) does not match the local result; it may not validate DNSSEC, or its cache differs", q.Response.Rcode, b2i(q.Response.AD)))
+	}
 }
 
 // findZone finds the zone that contains name from SOA answers, walking towards the root
 // only when an answer does not place the name in a zone. For an alias the authority SOA
 // belongs to the target, so the walk starts at the parent of the alias.
 func (r *run) findZone(ctx context.Context, name string) string {
-	_, m := r.ask(ctx, name, dns.TypeSOA)
+	m := r.q(ctx, name, dns.TypeSOA)
 	if m == nil {
 		r.rep.Errors = append(r.rep.Errors, "could not determine the zone of "+name)
 		return ""
 	}
-	if m.Rcode == dns.RcodeSuccess || m.Rcode == dns.RcodeNameError {
-		exists := m.Rcode == dns.RcodeSuccess
-		r.rep.NameExists = &exists
-	}
-	if chain := r.aliasChain(m, name); len(chain) > 0 {
-		exists := true
-		r.rep.NameExists = &exists
-		r.rep.Records.AliasChain = chain
-	} else if z := zoneOf(m, name); z != "" {
-		return z
+	chain := r.aliasChain(m, name)
+	exists := m.Rcode == dns.RcodeSuccess || len(chain) > 0
+	r.rep.NameExists, r.rep.AliasChain = &exists, chain
+	if len(chain) == 0 {
+		if z := zoneOf(m, name); z != "" {
+			return z
+		}
 	}
 	for p := name; p != "."; {
 		p = parent(p)
-		_, m := r.ask(ctx, p, dns.TypeSOA)
+		m := r.q(ctx, p, dns.TypeSOA)
 		if m == nil {
 			break
 		}
@@ -269,7 +511,7 @@ func zoneOf(m *dns.Msg, name string) string {
 	if s := answers[*dns.SOA](m, name); len(s) > 0 {
 		return name
 	}
-	if len(m.Answer) > 0 || (m.Rcode != dns.RcodeSuccess && m.Rcode != dns.RcodeNameError) {
+	if len(m.Answer) > 0 {
 		return ""
 	}
 	for _, rr := range m.Ns {
@@ -329,333 +571,45 @@ func answers[T dns.RR](m *dns.Msg, owner string) []T {
 	return out
 }
 
-// isNoData reports a NOERROR/NODATA DS answer that carries the SOA of a proper ancestor
-// of zone, that is, a negative answer from the parent side. An empty answer alone is not
-// enough.
-func isNoData(m *dns.Msg, zone string) bool {
-	if m == nil || m.Rcode != dns.RcodeSuccess || len(m.Answer) > 0 {
-		return false
-	}
-	for _, rr := range m.Ns {
-		if s, ok := rr.(*dns.SOA); ok && dns.IsSubDomain(s.Hdr.Name, zone) && !strings.EqualFold(s.Hdr.Name, zone) {
-			return true
-		}
-	}
-	return false
-}
-
 func isZoneKey(k *dns.DNSKEY) bool { return k.Flags&dns.ZONE != 0 && k.Protocol == 3 }
 
-// checkDS compares every DS with every zone key by algorithm, key tag and computed
-// digest. One matching DS is enough (rollover); colliding key tags are all tried.
-// It returns the DS-referenced keys.
-func checkDS(root bool, dss []*dns.DS, keys []*dns.DNSKEY) (Check, []DS, []*dns.DNSKEY) {
-	c := Check{ID: "ds.match", Description: "A DS record at the parent matches a DNSKEY of the zone"}
-	switch {
-	case root:
-		c.Result, c.Evidence = NA, "the root zone has no parent DS"
-		return c, nil, nil
-	case dss == nil:
-		c.Result, c.Evidence = Unknown, "no usable answer to the DS query"
-		return c, nil, nil
-	case len(dss) == 0:
-		c.Result, c.Evidence = NA, "no DS records were returned for the zone"
-		return c, []DS{}, nil
-	}
-	out := []DS{}
-	var matched []*dns.DNSKEY
-	var tags []string
-	unsupported := 0
+func tags(dss []*dns.DS) string {
+	var s []string
 	for _, d := range dss {
-		e := DS{d.KeyTag, d.Algorithm, d.DigestType, strings.ToUpper(d.Digest), "no_match"}
-		if keys == nil {
-			e.Match = "unknown"
-		}
-		for _, k := range keys {
-			if !isZoneKey(k) || k.Algorithm != d.Algorithm || k.KeyTag() != d.KeyTag {
-				continue
-			}
-			got := k.ToDS(d.DigestType)
-			if got == nil {
-				e.Match = "unsupported_digest"
-				unsupported++
-				break
-			}
-			if strings.EqualFold(got.Digest, d.Digest) {
-				e.Match = "match"
-				matched = append(matched, k)
-				tags = append(tags, fmt.Sprint(d.KeyTag))
-				break
-			}
-		}
-		out = append(out, e)
+		s = append(s, fmt.Sprint(d.KeyTag))
 	}
-	slices.SortFunc(out, func(a, b DS) int {
-		return cmp.Or(cmp.Compare(a.KeyTag, b.KeyTag), cmp.Compare(a.Algorithm, b.Algorithm),
-			cmp.Compare(a.DigestType, b.DigestType), strings.Compare(a.Digest, b.Digest))
-	})
-	c.Evidence = fmt.Sprintf("%d of %d DS records match a DNSKEY", len(matched), len(dss))
-	switch {
-	case len(matched) > 0:
-		c.Result = Pass
-		c.Evidence += " (key tags " + strings.Join(tags, ", ") + ")"
-	case keys == nil:
-		c.Result, c.Evidence = Unknown, "DS records found, but no usable answer to the DNSKEY query"
-	case unsupported > 0:
-		c.Result = Unknown
-		c.Evidence += fmt.Sprintf("; %d use a digest type this tool cannot compute", unsupported)
-	default:
-		c.Result = Fail
-		c.Suggestion = "If other resolvers show the same data, compare the DS records at the parent with the zone's current DNSKEY records; a DS left over from a key rollover is a common cause."
-	}
-	return c, out, matched
+	return strings.Join(s, ", ")
 }
 
-// checkSigs verifies the RRSIGs over the zone's RRset of type covered. One valid and
-// current signature is enough; old extra signatures do not invalidate it. When anchors
-// is set, the passing signature must come from one of those keys.
-func checkSigs(id, zone string, covered uint16, m *dns.Msg, keys, anchors []*dns.DNSKEY, now time.Time) (Check, []RRSIG) {
-	t := dns.TypeToString[covered]
-	c := Check{ID: id, Description: t + " RRset has a valid, current signature from a zone key"}
-	if m == nil {
-		c.Result, c.Evidence = Unknown, "no usable answer to the "+t+" query"
-		return c, nil
-	}
-	var set []dns.RR
-	for _, rr := range m.Answer {
-		if rr.Header().Rrtype == covered && strings.EqualFold(rr.Header().Name, zone) {
-			set = append(set, rr)
-		}
-	}
-	if len(set) == 0 {
-		c.Result, c.Evidence = NA, "no "+t+" RRset to check"
-		return c, nil
-	}
-	sigs := []RRSIG{}
-	for _, rr := range m.Answer {
-		if s, ok := rr.(*dns.RRSIG); ok && s.TypeCovered == covered && strings.EqualFold(s.Hdr.Name, zone) {
-			sigs = append(sigs, evalSig(s, zone, set, keys, now))
-		}
-	}
-	slices.SortFunc(sigs, func(a, b RRSIG) int {
-		return cmp.Or(cmp.Compare(a.KeyTag, b.KeyTag), cmp.Compare(a.expiry, b.expiry), strings.Compare(a.Signature, b.Signature))
-	})
-	if len(sigs) == 0 {
-		if len(keys) == 0 {
-			c.Result, c.Evidence = NA, "the zone publishes no DNSKEY and the "+t+" RRset is unsigned"
-		} else {
-			c.Result, c.Evidence = Fail, "no RRSIG covers the "+t+" RRset"
-		}
-		return c, sigs
-	}
-	var good, anchored, cryptoOK, undetermined int
-	for _, s := range sigs {
-		switch s.Signature {
-		case "valid":
-			cryptoOK++
-			if s.Time == "valid" {
-				good++
-				if anchors == nil || slices.Contains(anchors, s.key) {
-					anchored++
-				}
-			}
-		case "unsupported", "no_key":
-			undetermined++
-		}
-	}
-	c.Evidence = fmt.Sprintf("%d of %d signatures are cryptographically valid and current", good, len(sigs))
-	switch {
-	case anchored > 0:
-		c.Result = Pass
-	case good > 0:
-		c.Result = Fail
-		c.Evidence += "; none was made by a key referenced by a DS record"
-	case cryptoOK > 0:
-		c.Result = Fail
-		c.Evidence += "; the cryptographically valid ones are outside their validity period"
-		c.Suggestion = "Check that the zone signer is running and re-signing the zone, and that its clock is correct."
-	case undetermined > 0:
-		c.Result = Unknown
-		c.Evidence += "; some could not be verified locally (unsupported algorithm or no matching key)"
-	default:
-		c.Result = Fail
-	}
-	return c, sigs
+// ponytail: uint32 RRSIG times read as Unix seconds, correct until 2106.
+func sigTime(t uint32) time.Time { return time.Unix(int64(t), 0).UTC() }
+
+func ts(t uint32) string { return sigTime(t).Format("2006-01-02 15:04 UTC") }
+
+// rrLine prints a record in zone file format without TTL and class.
+func rrLine(rr dns.RR) string {
+	h := rr.Header()
+	return h.Name + " " + dns.TypeToString[h.Rrtype] + " " + strings.TrimPrefix(rr.String(), h.String())
 }
 
-func evalSig(s *dns.RRSIG, zone string, set []dns.RR, keys []*dns.DNSKEY, now time.Time) RRSIG {
-	// ponytail: uint32 RRSIG times read as Unix seconds, correct until 2106.
-	inc, exp := time.Unix(int64(s.Inception), 0).UTC(), time.Unix(int64(s.Expiration), 0).UTC()
-	e := RRSIG{
-		Covers: dns.TypeToString[s.TypeCovered], Signer: strings.ToLower(s.SignerName), KeyTag: s.KeyTag,
-		Algorithm: s.Algorithm, Inception: inc.Format(time.RFC3339), Expiration: exp.Format(time.RFC3339),
-		Signature: "no_key", Time: "valid", ExpiresIn: exp.Sub(now).Round(time.Second).String(), expiry: exp.Unix(),
+func rrLines[T dns.RR](rrs []T) []string {
+	out := []string{}
+	for _, rr := range rrs {
+		out = append(out, rrLine(rr))
 	}
-	switch {
-	case s.ValidityPeriod(now):
-	case now.Before(inc):
-		e.Time = "not_yet_valid"
-	default:
-		e.Time = "expired"
-	}
-	if !strings.EqualFold(s.SignerName, zone) {
-		e.Signature = "wrong_signer"
-		return e
-	}
-	for _, k := range keys {
-		if !isZoneKey(k) || k.Algorithm != s.Algorithm || k.KeyTag() != s.KeyTag {
-			continue
-		}
-		err := s.Verify(k, set)
-		switch {
-		case err == nil:
-			e.Signature, e.key = "valid", k
-			return e
-		case errors.Is(err, dns.ErrAlg):
-			e.Signature = "unsupported"
-		case e.Signature != "unsupported":
-			e.Signature = "invalid"
-		}
-	}
-	return e
+	return out
 }
 
-func checkExpiry(sigs []RRSIG, warn time.Duration, now time.Time) Check {
-	c := Check{ID: "signatures.expiry", Description: fmt.Sprintf("Valid signatures do not expire within %s", warn)}
-	best := map[string]int64{}
-	for _, s := range sigs {
-		if s.Signature == "valid" && s.Time == "valid" && s.expiry > best[s.Covers] {
-			best[s.Covers] = s.expiry
-		}
+// keyLine prints a DNSKEY without its key material.
+func keyLine(k *dns.DNSKEY) string {
+	role := "ZSK"
+	if k.Flags&dns.SEP != 0 {
+		role = "KSK"
 	}
-	if len(best) == 0 {
-		c.Result, c.Evidence = NA, "no valid, current signature to evaluate"
-		return c
-	}
-	c.Result = Pass
-	var parts []string
-	for _, t := range slices.Sorted(maps.Keys(best)) {
-		exp := time.Unix(best[t], 0).UTC()
-		left := exp.Sub(now)
-		parts = append(parts, fmt.Sprintf("%s signature expires %s (in %s)", t, exp.Format(time.RFC3339), left.Round(time.Second)))
-		if left < warn {
-			c.Result = Warn
-		}
-	}
-	c.Evidence = "latest valid " + strings.Join(parts, "; ")
-	if c.Result == Warn {
-		c.Suggestion = "Make sure the zone is re-signed before the signatures expire; this alone does not make the zone bogus."
-	}
-	return c
+	return fmt.Sprintf("%s DNSKEY %d %d %d (key tag %d, %s)", k.Hdr.Name, k.Flags, k.Protocol, k.Algorithm, k.KeyTag(), role)
 }
 
-func checkResolver(trusted bool, soa, key *Response) Check {
-	c := Check{ID: "resolver.validation", Description: "Resolver authenticated SOA and DNSKEY (AD=1)"}
-	if soa == nil || key == nil {
-		c.Result, c.Evidence = Unknown, "no reply to the SOA or DNSKEY query"
-		return c
-	}
-	c.Evidence = fmt.Sprintf("SOA %s AD=%d, DNSKEY %s AD=%d", soa.Rcode, b2i(soa.AD), key.Rcode, b2i(key.AD))
-	switch {
-	case soa.Rcode == "SERVFAIL" || key.Rcode == "SERVFAIL":
-		c.Result = Unknown
-		if trusted && (bogusEDE(soa) != nil || bogusEDE(key) != nil) {
-			c.Result = Fail
-		}
-	case soa.AD && key.AD && trusted:
-		c.Result = Pass
-	case soa.AD && key.AD:
-		c.Result = Unknown
-		c.Evidence += "; the resolver is not trusted (see --trust-resolver)"
-	default:
-		c.Result = Unknown
-	}
-	return c
-}
-
-func checkKeysPresent(m *dns.Msg, keys []*dns.DNSKEY, dss []*dns.DS) Check {
-	c := Check{ID: "dnskey.present", Description: "The zone publishes DNSKEY records"}
-	switch {
-	case m == nil:
-		c.Result, c.Evidence = Unknown, "no usable answer to the DNSKEY query"
-	case len(keys) > 0:
-		c.Result, c.Evidence = Pass, fmt.Sprintf("%d DNSKEY records", len(keys))
-	case len(dss) > 0:
-		c.Result, c.Evidence = Fail, "the parent publishes DS records but the zone returned no DNSKEY"
-		c.Suggestion = "A signed delegation needs the zone to publish the DNSKEY referenced by the DS records."
-	default:
-		c.Result, c.Evidence = NA, "no DNSKEY records and no DS records: the zone appears unsigned"
-	}
-	return c
-}
-
-// bogusEDE returns the first EDE code that reports a DNSSEC validation failure
-// (RFC 8914 codes 6-12). Codes such as 1/2 (unsupported algorithm/digest, which make a
-// zone insecure) and 5 (indeterminate) are deliberately excluded.
-func bogusEDE(r *Response) *EDE {
-	for i, e := range r.EDE {
-		if e.Code >= dns.ExtendedErrorCodeDNSBogus && e.Code <= dns.ExtendedErrorCodeNSECMissing {
-			return &r.EDE[i]
-		}
-	}
-	return nil
-}
-
-type facts struct {
-	trusted, root bool
-	delegation    bool      // SOA and NS found at the zone apex
-	dsNoData      bool      // DS answer is NOERROR/NODATA with the parent's SOA
-	soa, dnskey   *Response // CD=0 replies; nil when no reply was received
-	ds            *Response
-	dsMatch       Result
-	dnskeySigs    Result
-	soaSigs       Result
-}
-
-// classify turns the evidence into a status. SECURE and INSECURE need a trusted resolver;
-// local checks can only block them, never produce BOGUS on their own.
-func classify(f facts) (Status, string) {
-	type reply struct {
-		what string
-		r    *Response
-	}
-	replies := []reply{{"SOA", f.soa}, {"DNSKEY", f.dnskey}}
-	if !f.root {
-		replies = append(replies, reply{"DS", f.ds})
-	}
-	for _, x := range replies {
-		if x.r == nil || x.r.Rcode != "SERVFAIL" {
-			continue
-		}
-		if e := bogusEDE(x.r); e != nil {
-			if f.trusted {
-				return Bogus, fmt.Sprintf("The trusted resolver reported a DNSSEC validation failure: SERVFAIL with EDE %d (%s) for %s.", e.Code, e.Name, x.what)
-			}
-			return Indeterminate, fmt.Sprintf("The resolver reported a DNSSEC validation failure (EDE %d for %s), but it is not trusted; rerun against a trusted validating resolver with --trust-resolver.", e.Code, x.what)
-		}
-	}
-	for _, x := range replies {
-		if x.r == nil {
-			return Indeterminate, "No reply to the " + x.what + " query; the DNSSEC status cannot be determined."
-		}
-		if x.r.Rcode == "SERVFAIL" {
-			return Indeterminate, "SERVFAIL for " + x.what + " without a DNSSEC-specific EDE: a DNSSEC failure is possible but not proven."
-		}
-	}
-	if !f.trusted {
-		return Indeterminate, "The resolver is not trusted, so its AD bit is only an observation; local checks alone cannot prove the chain of trust. Use --trust-resolver with a validating resolver you trust."
-	}
-	if f.soa.AD && f.dnskey.AD && f.soa.Rcode == "NOERROR" && f.dnskey.Rcode == "NOERROR" {
-		if (f.root || f.dsMatch == Pass) && f.dnskeySigs == Pass && f.soaSigs == Pass {
-			return Secure, "The trusted resolver validated SOA and DNSKEY (AD=1) and the local DS/DNSKEY/RRSIG checks agree. This covers the checked zone and RRsets only."
-		}
-		return Indeterminate, fmt.Sprintf("The resolver set AD=1, but local checks disagree or are incomplete (ds.match %s, dnskey.signatures %s, soa.signatures %s); answers or caches may be inconsistent.", f.dsMatch, f.dnskeySigs, f.soaSigs)
-	}
-	if !f.root && f.delegation && f.dsNoData && f.ds.AD && !f.soa.AD && !f.dnskey.AD {
-		return Insecure, "The trusted resolver authenticated that the parent has no DS for the zone (NOERROR/NODATA, AD=1): the zone is not protected by DNSSEC. This is not a DNS failure."
-	}
-	if f.dsNoData && !f.ds.AD {
-		return Indeterminate, "The parent returned no DS for the zone, but without AD=1 (for example an NSEC3 opt-out proof), so the absence of DNSSEC protection is not authenticated."
-	}
-	return Indeterminate, "The resolver did not authenticate the zone (AD=0) and the absence of a DS record was not proven; the zone may be unsigned or below an unsigned parent, which this tool cannot confirm."
+func sigLine(s *dns.RRSIG) string {
+	return fmt.Sprintf("%s RRSIG %s %d by %s key %d, valid %s to %s",
+		s.Hdr.Name, dns.TypeToString[s.TypeCovered], s.Algorithm, s.SignerName, s.KeyTag, ts(s.Inception), ts(s.Expiration))
 }
