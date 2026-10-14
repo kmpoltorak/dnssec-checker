@@ -164,13 +164,3 @@ func ParseResolver(s string) (string, error) {
 	}
 	return out, nil
 }
-
-// SystemResolver returns the first name server from resolv.conf. Only one is used so that
-// answers from different resolvers are never mixed.
-func SystemResolver(path string) (string, error) {
-	cfg, err := dns.ClientConfigFromFile(path)
-	if err != nil || len(cfg.Servers) == 0 {
-		return "", fmt.Errorf("no system resolver found in %s; use --resolver", path)
-	}
-	return ParseResolver(net.JoinHostPort(cfg.Servers[0], cfg.Port))
-}

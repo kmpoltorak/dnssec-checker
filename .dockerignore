@@ -1,0 +1,6 @@
+.git
+.github
+.env
+/dnssec-checker
+*.test
+*.out
