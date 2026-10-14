@@ -33,6 +33,7 @@ func TestUsageErrors(t *testing.T) {
 		{"--deadline", "-1s", "example.com"},
 		{"--warn-expiry", "-1h", "example.com"},
 		{"--resolver", "dns.example.net", "example.com"},
+		{"--trust-resolver", "example.com"}, // removed: the chain is validated locally
 		{"https://example.com/"},
 		{"192.0.2.1"},
 	} {
@@ -45,7 +46,7 @@ func TestUsageErrors(t *testing.T) {
 
 func TestHelpAndVersion(t *testing.T) {
 	code, out, _ := runCLI(t, "--help")
-	if code != 0 || !strings.Contains(out, "Usage: dnssec-checker [flags] domain") || !strings.Contains(out, "-trust-resolver") {
+	if code != 0 || !strings.Contains(out, "Usage: dnssec-checker [flags] domain") || !strings.Contains(out, "-resolver") {
 		t.Errorf("help: code %d, %q", code, out)
 	}
 	code, out, _ = runCLI(t, "--version")
@@ -64,33 +65,42 @@ func TestNoSystemResolver(t *testing.T) {
 	}
 }
 
+// serve starts a fake resolver with the signed chain . -> com. -> example.com. and makes
+// the CLI trust the test root.
+func serve(t *testing.T) (*dnstest.Server, *dnstest.Zone, *dnstest.Zone) {
+	srv := dnstest.Start(t)
+	root, com, example := dnstest.Chain(t, srv, time.Now())
+	old := anchors
+	anchors = root.Anchor()
+	t.Cleanup(func() { anchors = old })
+	return srv, com, example
+}
+
 func TestExitCodesAndJSON(t *testing.T) {
-	now := time.Now()
 	tests := []struct {
 		name   string
-		setup  func(*dnstest.Server)
-		trust  bool
+		setup  func(s *dnstest.Server, com, example *dnstest.Zone)
 		code   int
 		status string
+		dnssec string
 	}{
-		{"secure", func(s *dnstest.Server) { s.Signed(t, dnstest.NewZone(t, "example.com.", 257, 256), now, true) }, true, 0, "SECURE"},
-		{"untrusted", func(s *dnstest.Server) { s.Signed(t, dnstest.NewZone(t, "example.com.", 257), now, true) }, false, 3, "INDETERMINATE"},
-		{"insecure", func(s *dnstest.Server) { s.Unsigned(t, "example.com.", "com.", true) }, true, 1, "INSECURE"},
-		{"bogus", func(s *dnstest.Server) {
-			s.Signed(t, dnstest.NewZone(t, "example.com.", 257), now, true)
-			s.Set("example.com.", dns.TypeDNSKEY, dnstest.Reply{Rcode: dns.RcodeServerFailure, EDE: []uint16{dns.ExtendedErrorCodeDNSKEYMissing}})
-		}, true, 2, "BOGUS"},
-		{"network failure", func(s *dnstest.Server) { s.Set("example.com.", dns.TypeSOA, dnstest.Reply{Drop: -1}) }, true, 3, "INDETERMINATE"},
+		{"secure", func(*dnstest.Server, *dnstest.Zone, *dnstest.Zone) {}, 0, "SECURE", "yes"},
+		{"insecure", func(s *dnstest.Server, com, _ *dnstest.Zone) {
+			s.ServeUnsigned(t, "example.com.")
+			s.NoDS(t, com, "example.com.", "NS RRSIG NSEC")
+		}, 1, "INSECURE", "no"},
+		{"bogus", func(s *dnstest.Server, _, example *dnstest.Zone) {
+			s.Set("example.com.", dns.TypeSOA, dnstest.Reply{Answer: []dns.RR{example.SOA(t)}})
+		}, 2, "BOGUS", "broken"},
+		{"network failure", func(s *dnstest.Server, _, _ *dnstest.Zone) {
+			s.Set("example.com.", dns.TypeSOA, dnstest.Reply{Drop: -1})
+		}, 3, "INDETERMINATE", "unknown"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := dnstest.Start(t)
-			tt.setup(srv)
-			args := []string{"--resolver", srv.Addr, "--format", "json", "--timeout", "100ms"}
-			if tt.trust {
-				args = append(args, "--trust-resolver")
-			}
-			code, out, errOut := runCLI(t, append(args, "example.com")...)
+			srv, com, example := serve(t)
+			tt.setup(srv, com, example)
+			code, out, errOut := runCLI(t, "--resolver", srv.Addr, "--format", "json", "--timeout", "100ms", "example.com")
 			if code != tt.code || errOut != "" {
 				t.Errorf("code %d, want %d; stderr %q", code, tt.code, errOut)
 			}
@@ -105,11 +115,11 @@ func TestExitCodesAndJSON(t *testing.T) {
 			if _, err := dec.Token(); err != io.EOF {
 				t.Errorf("more than one JSON value on stdout: %v", err)
 			}
-			if rep["status"] != tt.status || rep["schema_version"] != 1.0 {
-				t.Errorf("status %v, schema %v", rep["status"], rep["schema_version"])
+			if rep["status"] != tt.status || rep["dnssec"] != tt.dnssec || rep["schema_version"] != 2.0 {
+				t.Errorf("status %v, dnssec %v, schema %v", rep["status"], rep["dnssec"], rep["schema_version"])
 			}
-			for _, k := range []string{"domain", "normalized_domain", "zone", "name_exists", "checked_at", "duration_ms",
-				"resolver", "validation_mode", "summary", "records", "queries", "checks", "warnings", "errors"} {
+			for _, k := range []string{"domain", "normalized_domain", "zone", "name_exists", "alias_chain", "summary", "chain",
+				"ns", "resolver", "checked_at", "duration_ms", "queries", "warnings", "errors"} {
 				if _, ok := rep[k]; !ok {
 					t.Errorf("missing key %q", k)
 				}
@@ -122,18 +132,17 @@ func TestExitCodesAndJSON(t *testing.T) {
 }
 
 func TestTextOutput(t *testing.T) {
-	srv := dnstest.Start(t)
-	srv.Signed(t, dnstest.NewZone(t, "example.com.", 257, 256), time.Now(), true)
-	code, out, _ := runCLI(t, "--resolver", srv.Addr, "--trust-resolver", "example.com")
+	srv, _, _ := serve(t)
+	code, out, _ := runCLI(t, "--resolver", srv.Addr, "example.com")
 	for _, want := range []string{
-		"Domain:       example.com.", "Zone:         example.com.", "(trusted by user)", "Status:       SECURE",
-		"[PASS] ds.match", "[PASS] soa.signatures", "DS (1):", "DNSKEY (2):", "RRSIG (2):", "Summary: ",
+		"example.com.  DNSSEC: YES, valid (SECURE)", "Chain of trust", "✔ .", "✔ com.", "✔ example.com.",
+		"matches the IANA root trust anchor", "example.com. DS ", "(agrees)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("text output lacks %q:\n%s", want, out)
 		}
 	}
-	if code != 0 {
-		t.Errorf("code %d", code)
+	if code != 0 || strings.Contains(out, "\x1b") {
+		t.Errorf("code %d, or colors when stdout is not a terminal", code)
 	}
 }
