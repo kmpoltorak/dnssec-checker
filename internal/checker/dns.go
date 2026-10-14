@@ -69,13 +69,13 @@ func (c *client) query(ctx context.Context, name string, qtype uint16, cd bool) 
 				q.msg, err = c.exchange(ctx, m, "tcp")
 			}
 		}
-		if err == nil || errors.Is(err, errQueryLimit) || ctx.Err() != nil {
+		if err == nil || errors.Is(err, errQueryLimit) || ctxErr(ctx) != nil {
 			break
 		}
 	}
 	if err != nil {
-		if ctx.Err() != nil {
-			err = ctx.Err()
+		if cerr := ctxErr(ctx); cerr != nil {
+			err = cerr
 		}
 		q.msg = nil
 		q.Error = err.Error()
@@ -83,6 +83,18 @@ func (c *client) query(ctx context.Context, name string, qtype uint16, cd bool) 
 	}
 	q.Response = summarize(q.msg)
 	return q
+}
+
+// ctxErr is ctx.Err(), but also reports a deadline that has passed before the context's
+// timer fired, so that a timeout at the deadline is not mistaken for a network error.
+func ctxErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d, ok := ctx.Deadline(); ok && !time.Now().Before(d) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func (c *client) exchange(ctx context.Context, m *dns.Msg, network string) (*dns.Msg, error) {
