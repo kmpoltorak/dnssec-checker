@@ -1,0 +1,12 @@
+# Binaries
+/dnssec-checker
+*.exe
+*.test
+
+# Coverage
+*.out
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
