@@ -47,10 +47,35 @@ Requires Go 1.27.2 or newer.
 go install github.com/kmpoltorak/dnssec-checker/cmd/dnssec-checker@latest
 ```
 
-Or build from a checkout:
+`go install` puts the binary in `$(go env GOPATH)/bin` (usually `~/go/bin`), or in
+`$GOBIN` when that is set. If that directory is not in your `PATH`, run the binary by
+its full path (`~/go/bin/dnssec-checker example.com`) or add the directory to `PATH`,
+for example in `~/.zshrc` or `~/.bashrc`:
+
+```sh
+export PATH="$PATH:$(go env GOPATH)/bin"
+```
+
+Then check that it works:
+
+```sh
+dnssec-checker --version
+```
+
+There are no release tags yet, so `@latest` installs a recent commit on `main`. The Go
+module proxy caches it (and `@main` too), so right after a change it can serve an older
+commit; `dnssec-checker --version` shows which one you have. To get the newest commit,
+bypass the proxy:
+
+```sh
+GOPROXY=direct go install github.com/kmpoltorak/dnssec-checker/cmd/dnssec-checker@main
+```
+
+Or build from a checkout; the binary is written to the current directory:
 
 ```sh
 go build ./cmd/dnssec-checker
+./dnssec-checker example.com
 ```
 
 ## Usage
