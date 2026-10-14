@@ -214,9 +214,13 @@ func NewZone(t testing.TB, name string, now time.Time, flags ...uint16) *Zone {
 			Hdr:   dns.RR_Header{Name: name, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 3600},
 			Flags: f, Protocol: 3, Algorithm: dns.ECDSAP256SHA256,
 		}
-		p, err := k.Generate(256)
-		if err != nil {
-			t.Fatal(err)
+		// miekg/dns refuses to sign with key tag 0, which a random key has once in 65536.
+		var p crypto.PrivateKey
+		for p == nil || k.KeyTag() == 0 {
+			var err error
+			if p, err = k.Generate(256); err != nil {
+				t.Fatal(err)
+			}
 		}
 		z.Keys = append(z.Keys, k)
 		z.signers[k] = p.(crypto.Signer)
