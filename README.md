@@ -3,9 +3,10 @@
 [![CI](https://github.com/kmpoltorak/dnssec-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/kmpoltorak/dnssec-checker/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A command-line tool that answers one question: does this domain have working DNSSEC?
-It validates the chain of trust itself, from the IANA root key down to the zone that
-contains the name, and shows the records that prove the answer.
+A command-line tool and web page that answer one question: does this domain have
+working DNSSEC? It validates the chain of trust itself, from the IANA root key down to
+the zone that contains the name and to the name's own A and AAAA records, and shows the
+records that prove the answer.
 
 ```text
 $ dnssec-checker example.com
@@ -228,8 +229,8 @@ chain of trust with one line per link (`✔` valid, `–` not signed, `✘` brok
 not check). The records that prove the result are printed under the steps for the
 checked zone: DS, DNSKEY (without key material), RRSIG, and NSEC/NSEC3 for an unsigned
 zone. A second section, "Records of <name>", shows the result for the A and AAAA
-answers with their records and signatures. Then come the zone, whether the name exists, aliases, name servers, the
-resolver's own answer, warnings and errors. Colors are used only when stdout is a
+answers with their records and signatures. Then come the zone, whether the name exists,
+aliases, name servers, the resolver's own answer, warnings and errors. Colors are used only when stdout is a
 terminal and `NO_COLOR` is not set.
 
 JSON is a single object on stdout. Errors and usage messages go to stderr. Fields:
@@ -265,7 +266,7 @@ docker compose config --quiet && docker build .
 ```
 
 The tests run offline. `internal/dnstest` starts a fake recursive resolver on random
-UDP and TCP ports on `127.0.0.1` and serves a synthetic chain `.` → `com.` →
+UDP, TCP and DNS over TLS ports on `127.0.0.1` and serves a synthetic chain `.` → `com.` →
 `example.com.`, signed with ECDSA P-256 keys generated during the test and checked
 against a test trust anchor. Signature validity uses an injected clock. No real keys or
 secrets are in the repository. Results do not depend on any public domain.
@@ -277,9 +278,9 @@ request.
 ## Contributing
 
 Bug reports and pull requests are welcome. Please open an issue first for larger
-changes. A pull request should keep CI green and add a test for every behavior change;
-see [AGENTS.md](AGENTS.md) for the full rules (they apply to people and AI agents
-alike). Tests must stay offline and use only `example.com` / `example.net` names and
+changes. A pull request should keep CI green and add a test for every behavior change.
+[AGENTS.md](AGENTS.md) lists the rules this repository is developed with. Tests must
+stay offline and use only reserved example names (RFC 2606, such as `example.com`) and
 RFC 5737 addresses.
 
 ## Security
