@@ -1,5 +1,8 @@
 # dnssec-checker
 
+[![CI](https://github.com/kmpoltorak/dnssec-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/kmpoltorak/dnssec-checker/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A command-line tool that answers one question: does this domain have working DNSSEC?
 It validates the chain of trust itself, from the IANA root key down to the zone that
 contains the name, and shows the records that prove the answer.
@@ -19,7 +22,21 @@ Chain of trust (validated locally from the IANA root key)
       ...
 ```
 
-The output above is an illustration, not a real measurement.
+An unsigned and a broken zone look like this:
+
+```text
+example.net.  DNSSEC: NO, not signed (INSECURE)
+  ✔ .             DNSKEY 20326 matches the IANA root trust anchor; DNSKEY set signed by key 20326
+  ✔ net.          DS 37331 in . → DNSKEY 37331; DNSKEY set signed by key 37331
+  – example.net.  no DS in net.; the absence is proven by a signed NSEC3 opt-out (RFC 5155) record
+
+example.org.  DNSSEC: BROKEN, validation fails (BOGUS)
+  ✔ .             DNSKEY 20326 matches the IANA root trust anchor; DNSKEY set signed by key 20326
+  ✔ org.          DS 26974 in . → DNSKEY 26974; DNSKEY set signed by key 26974
+  ✘ example.org.  no DNSKEY matches the DS records (key tag 42069)
+```
+
+These outputs are illustrations, not real measurements.
 
 ## Install
 
@@ -57,6 +74,13 @@ dnssec-checker --version
 
 If no resolver is configured on the system, the tool exits with an error that asks for
 `--resolver`. It never falls back to a public DNS provider.
+
+In scripts, use the exit code (see [Status](#status)) or the JSON `dnssec` field:
+
+```sh
+if dnssec-checker example.com >/dev/null; then echo "DNSSEC is valid"; fi
+dnssec-checker --format json example.com | jq -r .dnssec   # yes, no, broken or unknown
+```
 
 ### Input
 
@@ -186,6 +210,20 @@ against a test trust anchor. Signature validity uses an injected clock. No real 
 secrets are in the repository. Results do not depend on any public domain.
 `govulncheck` needs network access to the Go vulnerability database. CI runs the same
 commands on every push and pull request.
+
+## Contributing
+
+Bug reports and pull requests are welcome. Please open an issue first for larger
+changes. A pull request should keep CI green and add a test for every behavior change;
+see [AGENTS.md](AGENTS.md) for the full rules (they apply to people and AI agents
+alike). Tests must stay offline and use only `example.com` / `example.net` names and
+RFC 5737 addresses.
+
+## Security
+
+Please report vulnerabilities privately through
+[GitHub security advisories](https://github.com/kmpoltorak/dnssec-checker/security/advisories/new),
+not in public issues.
 
 ## License
 
