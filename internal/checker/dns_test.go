@@ -13,7 +13,7 @@ import (
 )
 
 func testClient(srv *dnstest.Server) *client {
-	return &client{server: srv.Addr, timeout: 200 * time.Millisecond, maxQueries: maxQueries}
+	return newClient(srv.Addr, 200*time.Millisecond, maxQueries, nil)
 }
 
 func TestQueryFlags(t *testing.T) {
@@ -149,5 +149,43 @@ func TestSystemResolver(t *testing.T) {
 	}
 	if _, err := SystemResolver(filepath.Join(dir, "missing")); err == nil {
 		t.Error("missing file: want error")
+	}
+}
+
+func TestQueryInterruptIsImmediate(t *testing.T) {
+	srv := dnstest.Start(t)
+	srv.Set("example.com.", dns.TypeSOA, dnstest.Reply{Drop: -1})
+	c := testClient(srv)
+	c.timeout = 10 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	q := c.query(ctx, "example.com.", dns.TypeSOA, false)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("interrupt took %s with a 10s timeout", d)
+	}
+	if q.Error != context.Canceled.Error() {
+		t.Errorf("error = %q", q.Error)
+	}
+}
+
+func TestQueryOverTLS(t *testing.T) {
+	srv := dnstest.Start(t)
+	srv.Set("example.com.", dns.TypeSOA, dnstest.Reply{AD: true})
+	addr, roots := srv.StartTLS(t)
+	c := newClient("tls://"+addr, time.Second, maxQueries, roots)
+	q := c.query(context.Background(), "example.com.", dns.TypeSOA, true)
+	if q.Response == nil || q.Transport != "tls" || !q.Response.AD {
+		t.Fatalf("response %+v, transport %q, error %q", q.Response, q.Transport, q.Error)
+	}
+	// The certificate is for 127.0.0.1, not for another name.
+	c = newClient("tls://"+addr+"#dns.example.net", time.Second, maxQueries, roots)
+	if q := c.query(context.Background(), "example.com.", dns.TypeSOA, true); q.Response != nil || !strings.Contains(q.Error, "certificate") {
+		t.Errorf("wrong name: response %+v, error %q", q.Response, q.Error)
+	}
+	// An untrusted certificate is rejected.
+	c = newClient("tls://"+addr, time.Second, maxQueries, nil)
+	if q := c.query(context.Background(), "example.com.", dns.TypeSOA, true); q.Response != nil {
+		t.Error("untrusted certificate accepted")
 	}
 }

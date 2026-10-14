@@ -4,9 +4,11 @@ package checker
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -40,6 +42,39 @@ type Config struct {
 	Now        func() time.Time // clock for signature validity; time.Now when nil
 	MaxQueries int              // packets per run; maxQueries when 0
 	Anchors    []*dns.DS        // root trust anchors; RootAnchors when nil
+	TLSRoots   *x509.CertPool   // CA pool for DNS over TLS; the system pool when nil
+}
+
+// LoadAnchors reads root trust anchors from a file of DS or DNSKEY records owned by "."
+// in zone file format. DNSKEY records are turned into SHA-256 DS records.
+func LoadAnchors(path string) ([]*dns.DS, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var out []*dns.DS
+	zp := dns.NewZoneParser(f, ".", path)
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		if rr.Header().Name != "." {
+			return nil, fmt.Errorf("%s: trust anchor for %s; only the root zone is supported", path, rr.Header().Name)
+		}
+		switch x := rr.(type) {
+		case *dns.DS:
+			out = append(out, x)
+		case *dns.DNSKEY:
+			out = append(out, x.ToDS(dns.SHA256))
+		default:
+			return nil, fmt.Errorf("%s: %s record; want DS or DNSKEY", path, dns.TypeToString[rr.Header().Rrtype])
+		}
+	}
+	if err := zp.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s: no DS or DNSKEY records", path)
+	}
+	return out, nil
 }
 
 // Algorithms and DS digest types this tool validates (RFC 8624). A zone whose DS
@@ -118,12 +153,13 @@ func Run(ctx context.Context, cfg Config, domain string) (*Report, error) {
 	}
 	start := time.Now()
 	r := &run{
-		cfg: cfg,
-		c:   &client{server: cfg.Resolver, timeout: cfg.Timeout, maxQueries: cfg.MaxQueries},
-		now: cfg.Now().UTC(),
+		cfg:   cfg,
+		c:     newClient(cfg.Resolver, cfg.Timeout, cfg.MaxQueries, cfg.TLSRoots),
+		now:   cfg.Now().UTC(),
+		trust: map[string]trust{},
 		rep: &Report{
 			SchemaVersion: 2, Domain: domain, NormalizedDomain: name, Status: Indeterminate,
-			AliasChain: []string{}, Chain: []Step{}, Resolver: Resolver{Address: cfg.Resolver},
+			AliasChain: []string{}, Chain: []Step{}, Lookups: []Lookup{}, Resolver: Resolver{Address: cfg.Resolver},
 			Queries: []Query{}, Warnings: []string{}, Errors: []string{},
 		},
 	}
@@ -133,6 +169,9 @@ func Run(ctx context.Context, cfg Config, domain string) (*Report, error) {
 	} else {
 		r.rep.Zone = &zone
 		r.rep.Status, r.rep.Summary = r.validate(ctx, zone)
+		if r.rep.Status == Secure {
+			r.checkName(ctx, name, zone)
+		}
 		r.nameServers(ctx, zone)
 		r.resolverView(ctx, zone)
 	}
@@ -145,10 +184,20 @@ func Run(ctx context.Context, cfg Config, domain string) (*Report, error) {
 }
 
 type run struct {
-	cfg Config
-	c   *client
-	now time.Time
-	rep *Report
+	cfg   Config
+	c     *client
+	now   time.Time
+	rep   *Report
+	trust map[string]trust // chain results per name, so each label is walked once
+}
+
+// trust is where the chain of trust stands for a name.
+type trust struct {
+	zone   string        // deepest zone reached whose keys are validated
+	keys   []*dns.DNSKEY // its keys
+	status Status        // "" while the chain is intact; otherwise why it ended
+	at     string        // the label where it ended
+	why    string        // a sentence for the summary
 }
 
 // q sends a CD=1 query, so that the resolver passes data through even when its own
@@ -178,68 +227,93 @@ func (r *run) step(zone, result, detail string, records []string) {
 	r.rep.Chain = append(r.rep.Chain, Step{zone, result, detail, records})
 }
 
-// validate walks from the root to zone. At every label it asks for DS: a validly signed
-// DS leads to the child's DNSKEY set; a signed NSEC/NSEC3 proof shows either that the
-// label is not a delegation (keep walking) or an insecure delegation (stop).
+// validate checks the chain of trust to zone and the signature of its SOA.
 func (r *run) validate(ctx context.Context, zone string) (Status, string) {
-	keys, st, why := r.zoneKeys(ctx, ".", "", r.cfg.Anchors, nil)
-	if st != "" {
-		return st, why
-	}
-	cur := "."
-	labels := dns.SplitDomainName(zone)
-	for i := len(labels) - 1; i >= 0; i-- {
-		name := dns.Fqdn(strings.Join(labels[i:], "."))
-		m := r.q(ctx, name, dns.TypeDS)
-		if m == nil {
-			r.step(name, StepError, "no usable answer to the DS query", nil)
-			return Indeterminate, "The DS query for " + name + " failed, so the chain of trust could not be followed."
-		}
-		if dss := answers[*dns.DS](m, name); len(dss) > 0 {
-			_, sig, why := verify(m.Answer, name, dns.TypeDS, cur, keys, r.now)
-			ev := rrLines(dss)
-			if sig == nil {
-				r.step(name, StepFail, "DS in "+cur+" is not validly signed: "+why, ev)
-				return Bogus, fmt.Sprintf("The DS record of %s in %s is not validly signed (%s), so DNSSEC validation fails.", name, cur, why)
-			}
-			if keys, st, why = r.zoneKeys(ctx, name, cur, dss, append(ev, sigLine(sig))); st != "" {
-				return st, why
-			}
-			cur = name
-			continue
-		}
-		switch kind, proof, ev := denyDS(m, name, cur, keys, r.now); kind {
-		case notDelegation:
-			continue
-		case insecureDelegation:
-			r.step(name, StepInsecure, "no DS in "+cur+"; the absence is proven by a signed "+proof+" record", ev)
-			if name == zone {
-				return Insecure, fmt.Sprintf("%s is not signed: its parent %s proves with a signed record that there is no DS for it.", zone, cur)
-			}
-			return Insecure, fmt.Sprintf("%s is not protected by DNSSEC: it is below %s, which is not signed (%s proves there is no DS for it).", zone, name, cur)
-		default:
-			r.step(name, StepFail, "no DS in "+cur+" and no valid signed proof that it is absent", ev)
-			return Bogus, fmt.Sprintf("%s is signed, but it neither has a DS record for %s nor a valid signed proof that there is none.", cur, name)
-		}
-	}
-	if cur != zone {
-		r.step(zone, StepFail, "the parent zone "+cur+" proves that "+zone+" is not a delegation", nil)
-		return Bogus, fmt.Sprintf("%s has an SOA record, but its signed parent %s proves it is not a delegation.", zone, cur)
+	t := r.chain(ctx, zone)
+	switch {
+	case t.status == Insecure && t.at != zone:
+		return Insecure, fmt.Sprintf("%s is not protected by DNSSEC: it is below %s, which is not signed.", zone, t.at)
+	case t.status != "":
+		return t.status, t.why
+	case t.zone != zone:
+		r.step(zone, StepFail, "the parent zone "+t.zone+" proves that "+zone+" is not a delegation", nil)
+		return Bogus, fmt.Sprintf("%s has an SOA record, but its signed parent %s proves it is not a delegation.", zone, t.zone)
 	}
 	m := r.q(ctx, zone, dns.TypeSOA)
 	if m == nil {
 		r.step(zone, StepError, "no usable answer to the SOA query", nil)
 		return Indeterminate, "The SOA query for " + zone + " failed."
 	}
-	set, sig, why := verify(m.Answer, zone, dns.TypeSOA, zone, keys, r.now)
+	set, sig, why := verify(m.Answer, zone, dns.TypeSOA, zone, t.keys, r.now)
 	ev := rrLines(set)
 	if sig == nil {
 		r.step(zone, StepFail, "SOA is not validly signed: "+why, ev)
 		return Bogus, fmt.Sprintf("The SOA record of %s is not validly signed (%s), so DNSSEC validation fails.", zone, why)
 	}
-	r.step(zone, StepOK, fmt.Sprintf("SOA signed by key %d, valid until %s", sig.KeyTag, ts(sig.Expiration)), append(ev, sigLine(sig)))
+	r.step(zone, StepOK, fmt.Sprintf("SOA signed by key %d, valid until %s", sig.KeyTag, ts(sig.Expiration, r.now)), append(ev, sigLine(sig, r.now)))
 	r.warnExpiry(zone, sig)
 	return Secure, fmt.Sprintf("DNSSEC is enabled and valid: every link from the IANA root key to the SOA record of %s verifies.", zone)
+}
+
+// chain walks from the root towards name. At every label it asks for DS: a validly
+// signed DS leads to the child's DNSKEY set; a signed NSEC/NSEC3 proof shows either that
+// the label is not a delegation (keep walking) or an insecure delegation (stop). It
+// returns the deepest zone reached; results are cached per label.
+func (r *run) chain(ctx context.Context, name string) trust {
+	t, ok := r.trust["."]
+	if !ok {
+		keys, st, why := r.zoneKeys(ctx, ".", "", r.cfg.Anchors, nil)
+		t = trust{zone: ".", keys: keys, status: st, at: ".", why: why}
+		r.trust["."] = t
+	}
+	labels := dns.SplitDomainName(name)
+	for i := len(labels) - 1; i >= 0 && t.status == ""; i-- {
+		n := dns.Fqdn(strings.Join(labels[i:], "."))
+		next, ok := r.trust[n]
+		if !ok {
+			var nxdomain bool
+			next, nxdomain = r.descend(ctx, n, t)
+			r.trust[n] = next
+			if nxdomain {
+				return next // nothing exists below a name that does not exist
+			}
+		}
+		t = next
+	}
+	return t
+}
+
+// descend follows the chain from t (the zone containing name's parent) to name.
+func (r *run) descend(ctx context.Context, name string, t trust) (next trust, nxdomain bool) {
+	stop := func(st Status, why string) trust { return trust{t.zone, t.keys, st, name, why} }
+	m := r.q(ctx, name, dns.TypeDS)
+	if m == nil {
+		r.step(name, StepError, "no usable answer to the DS query", nil)
+		return stop(Indeterminate, "The DS query for "+name+" failed, so the chain of trust could not be followed."), false
+	}
+	if dss := answers[*dns.DS](m, name); len(dss) > 0 {
+		_, sig, why := verify(m.Answer, name, dns.TypeDS, t.zone, t.keys, r.now)
+		ev := rrLines(dss)
+		if sig == nil {
+			r.step(name, StepFail, "DS in "+t.zone+" is not validly signed: "+why, ev)
+			return stop(Bogus, fmt.Sprintf("The DS record of %s in %s is not validly signed (%s), so DNSSEC validation fails.", name, t.zone, why)), false
+		}
+		keys, st, why := r.zoneKeys(ctx, name, t.zone, dss, append(ev, sigLine(sig, r.now)))
+		if st != "" {
+			return stop(st, why), false
+		}
+		return trust{zone: name, keys: keys}, false
+	}
+	switch kind, proof, ev := denyDS(m, name, t.zone, t.keys, r.now); kind {
+	case notDelegation:
+		return t, m.Rcode == dns.RcodeNameError
+	case insecureDelegation:
+		r.step(name, StepInsecure, "no DS in "+t.zone+"; the absence is proven by a signed "+proof+" record", ev)
+		return stop(Insecure, fmt.Sprintf("%s is not signed: its parent %s proves with a signed record that there is no DS for it.", name, t.zone)), false
+	default:
+		r.step(name, StepFail, "no DS in "+t.zone+" and no valid signed proof that it is absent", ev)
+		return stop(Bogus, fmt.Sprintf("%s is signed, but it neither has a DS record for %s nor a valid signed proof that there is none.", t.zone, name)), false
+	}
 }
 
 // zoneKeys fetches the DNSKEY set of zone and checks it against the DS records (or the
@@ -295,7 +369,7 @@ func (r *run) zoneKeys(ctx context.Context, zone, parentZone string, dss []*dns.
 	if zone == "." {
 		detail = fmt.Sprintf("DNSKEY %d matches the IANA root trust anchor; DNSKEY set signed by key %d", sig.KeyTag, sig.KeyTag)
 	}
-	r.step(zone, StepOK, detail, append(ev, sigLine(sig)))
+	r.step(zone, StepOK, detail, append(ev, sigLine(sig, r.now)))
 	r.warnExpiry(zone, sig)
 	return slices.DeleteFunc(all, func(k *dns.DNSKEY) bool { return !isZoneKey(k) }), "", ""
 }
@@ -336,7 +410,7 @@ func verify(rrs []dns.RR, owner string, t uint16, signer string, keys []*dns.DNS
 			case err != nil:
 				why = fmt.Sprintf("signature by key %d does not verify (%v)", s.KeyTag, err)
 			case !s.ValidityPeriod(now):
-				why = fmt.Sprintf("signature by key %d is valid only from %s to %s", s.KeyTag, ts(s.Inception), ts(s.Expiration))
+				why = fmt.Sprintf("signature by key %d is valid only from %s to %s", s.KeyTag, ts(s.Inception, now), ts(s.Expiration, now))
 			default:
 				return set, s, ""
 			}
@@ -345,97 +419,14 @@ func verify(rrs []dns.RR, owner string, t uint16, signer string, keys []*dns.DNS
 	return set, nil, why
 }
 
-type denial int
-
-const (
-	noProof denial = iota
-	notDelegation
-	insecureDelegation
-)
-
-// denyDS checks a DS answer without DS records for a proof, signed by zone, that name has
-// no DS: an NSEC or NSEC3 record at name (RFC 4035 section 5.4, RFC 5155 section 8.5),
-// an NSEC that shows name is an empty non-terminal, or an NSEC3 opt-out span (RFC 5155
-// section 8.6). The proof also tells whether name is a delegation at all. proof names
-// the record type that proved it.
-func denyDS(m *dns.Msg, name, zone string, keys []*dns.DNSKEY, now time.Time) (kind denial, proof string, ev []string) {
-	var nsec []*dns.NSEC
-	var nsec3 []*dns.NSEC3
-	for _, rr := range m.Ns {
-		owner, t := rr.Header().Name, rr.Header().Rrtype
-		if t != dns.TypeNSEC && t != dns.TypeNSEC3 {
-			continue
-		}
-		if t == dns.TypeNSEC3 && !strings.EqualFold(parent(owner), zone) {
-			continue
-		}
-		if _, sig, _ := verify(m.Ns, owner, t, zone, keys, now); sig != nil {
-			ev = append(ev, rrLine(rr), sigLine(sig))
-			if n, ok := rr.(*dns.NSEC); ok {
-				nsec = append(nsec, n)
-			} else {
-				nsec3 = append(nsec3, rr.(*dns.NSEC3))
-			}
-		}
-	}
-	byBitmap := func(types []uint16) denial {
-		switch {
-		case slices.Contains(types, dns.TypeDS):
-			return noProof
-		case slices.Contains(types, dns.TypeNS) && !slices.Contains(types, dns.TypeSOA):
-			return insecureDelegation
-		case !slices.Contains(types, dns.TypeNS):
-			return notDelegation
-		}
-		return noProof // SOA at name: the answer came from the child, not the parent
-	}
-	for _, n := range nsec {
-		if strings.EqualFold(n.Hdr.Name, name) {
-			return byBitmap(n.TypeBitMap), "NSEC", ev
-		}
-		if canonicalLess(n.Hdr.Name, name) && dns.IsSubDomain(name, n.NextDomain) && !strings.EqualFold(n.NextDomain, name) {
-			return notDelegation, "NSEC", ev // empty non-terminal: the next name is below name
-		}
-	}
-	for _, n := range nsec3 {
-		if n.Match(name) {
-			return byBitmap(n.TypeBitMap), "NSEC3", ev
-		}
-	}
-	next := name
-	for ce := parent(name); dns.IsSubDomain(zone, ce); next, ce = ce, parent(ce) {
-		if slices.ContainsFunc(nsec3, func(n *dns.NSEC3) bool { return n.Match(ce) }) {
-			if slices.ContainsFunc(nsec3, func(n *dns.NSEC3) bool { return n.Flags&1 == 1 && n.Cover(next) }) {
-				return insecureDelegation, "NSEC3 opt-out (RFC 5155)", ev
-			}
-			break
-		}
-		if strings.EqualFold(ce, zone) {
-			break
-		}
-	}
-	return noProof, "", ev
-}
-
-// canonicalLess orders names as in RFC 4034 section 6.1: label by label from the right.
-func canonicalLess(a, b string) bool {
-	la, lb := dns.SplitDomainName(strings.ToLower(a)), dns.SplitDomainName(strings.ToLower(b))
-	for i := 1; i <= len(la) && i <= len(lb); i++ {
-		if c := strings.Compare(la[len(la)-i], lb[len(lb)-i]); c != 0 {
-			return c < 0
-		}
-	}
-	return len(la) < len(lb)
-}
-
 // warnExpiry warns about a signature that expires within --warn-expiry and in less than
 // a quarter of its validity period. The second condition keeps online signers, which
 // issue short-lived signatures on every answer, from always warning.
 func (r *run) warnExpiry(zone string, s *dns.RRSIG) {
-	inc, exp := sigTime(s.Inception), sigTime(s.Expiration)
+	inc, exp := sigTime(s.Inception, r.now), sigTime(s.Expiration, r.now)
 	if left := exp.Sub(r.now); left < r.cfg.WarnExpiry && left < exp.Sub(inc)/4 {
 		r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the %s signature of %s (key %d) expires in %s, at %s",
-			dns.TypeToString[s.TypeCovered], zone, s.KeyTag, left.Round(time.Minute), ts(s.Expiration)))
+			dns.TypeToString[s.TypeCovered], zone, s.KeyTag, left.Round(time.Minute), ts(s.Expiration, r.now)))
 	}
 }
 
@@ -581,10 +572,13 @@ func tags(dss []*dns.DS) string {
 	return strings.Join(s, ", ")
 }
 
-// ponytail: uint32 RRSIG times read as Unix seconds, correct until 2106.
-func sigTime(t uint32) time.Time { return time.Unix(int64(t), 0).UTC() }
+// sigTime turns an RRSIG time into the instant closest to now, using serial number
+// arithmetic (RFC 4034 section 3.1.5, RFC 1982), so it stays correct after 2106.
+func sigTime(t uint32, now time.Time) time.Time {
+	return time.Unix(now.Unix()+int64(int32(t-uint32(now.Unix()))), 0).UTC()
+}
 
-func ts(t uint32) string { return sigTime(t).Format("2006-01-02 15:04 UTC") }
+func ts(t uint32, now time.Time) string { return sigTime(t, now).Format("2006-01-02 15:04 UTC") }
 
 // rrLine prints a record in zone file format without TTL and class.
 func rrLine(rr dns.RR) string {
@@ -609,7 +603,7 @@ func keyLine(k *dns.DNSKEY) string {
 	return fmt.Sprintf("%s DNSKEY %d %d %d (key tag %d, %s)", k.Hdr.Name, k.Flags, k.Protocol, k.Algorithm, k.KeyTag(), role)
 }
 
-func sigLine(s *dns.RRSIG) string {
+func sigLine(s *dns.RRSIG, now time.Time) string {
 	return fmt.Sprintf("%s RRSIG %s %d by %s key %d, valid %s to %s",
-		s.Hdr.Name, dns.TypeToString[s.TypeCovered], s.Algorithm, s.SignerName, s.KeyTag, ts(s.Inception), ts(s.Expiration))
+		s.Hdr.Name, dns.TypeToString[s.TypeCovered], s.Algorithm, s.SignerName, s.KeyTag, ts(s.Inception, now), ts(s.Expiration, now))
 }
