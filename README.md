@@ -29,8 +29,7 @@ Requires Go 1.27.2 or newer.
 go install github.com/kmpoltorak/dnssec-checker/cmd/dnssec-checker@latest
 ```
 
-While the repository is private, set `GOPRIVATE=github.com/kmpoltorak/*` and make sure
-Git can authenticate to GitHub. You can also build from a checkout:
+Or build from a checkout:
 
 ```sh
 go build ./cmd/dnssec-checker
