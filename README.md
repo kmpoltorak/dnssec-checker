@@ -183,13 +183,15 @@ go vet ./...
 go test ./...
 go test -race ./...
 go build ./cmd/dnssec-checker
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 ```
 
 The tests run offline. `internal/dnstest` starts a fake recursive resolver on random
 UDP and TCP ports on `127.0.0.1` and serves synthetic `example.com` / `example.net`
 zones, signed with ECDSA P-256 keys generated during the test. Signature validity uses
 an injected clock. No real keys or secrets are in the repository. Results do not depend
-on any public domain. CI runs the same commands on every push and pull request.
+on any public domain. `govulncheck` needs network access to the Go vulnerability
+database. CI runs the same commands on every push and pull request.
 
 ## License
 
