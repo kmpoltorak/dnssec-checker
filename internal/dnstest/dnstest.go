@@ -4,7 +4,14 @@ package dnstest
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"math/big"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -71,11 +78,52 @@ func Start(t testing.TB) *Server {
 	return s
 }
 
+// StartTLS also serves DNS over TLS on a random 127.0.0.1 port, with a self-signed
+// certificate for 127.0.0.1. It returns the address and a pool that trusts the certificate.
+func (s *Server) StartTLS(t testing.TB) (string, *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)}, IsCA: true, BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, _ := x509.ParseCertificate(der)
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	l, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	srv := &dns.Server{Listener: l, Net: "tcp-tls", Handler: s, NotifyStartedFunc: func() { close(started) }}
+	go srv.ActivateAndServe()
+	<-started
+	t.Cleanup(func() { srv.Shutdown() })
+	return l.Addr().String(), pool
+}
+
 // Set installs the reply for CD=0 queries; CD=1 queries get it too unless SetCD is used.
 func (s *Server) Set(name string, qtype uint16, r Reply) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.replies[key(name, qtype, false)] = &r
+}
+
+// Get returns a copy of the CD=0 reply installed for a question.
+func (s *Server) Get(name string, qtype uint16) Reply {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := *s.replies[key(name, qtype, false)]
+	r.Answer, r.Ns = slices.Clone(r.Answer), slices.Clone(r.Ns)
+	return r
 }
 
 func (s *Server) SetCD(name string, qtype uint16, r Reply) {
@@ -214,13 +262,36 @@ func (z *Zone) Signed(t testing.TB, set ...dns.RR) []dns.RR {
 	return append(set, z.Sign(t, len(z.Keys)-1, set, z.From, z.Until))
 }
 
-// Serve installs the apex answers of z: DNSKEY signed by key 0, SOA and NS by the last
-// key. AD=1 on all of them.
+// Serve installs the apex answers of z: DNSKEY signed by key 0; SOA, NS and an A record
+// (192.0.2.1) by the last key; and a signed NODATA proof for AAAA whose NSEC points to
+// \000.<apex>, like online signers do. AD=1 on all of them.
 func (s *Server) Serve(t testing.TB, z *Zone) {
 	keys := z.KeySet()
 	s.Set(z.Name, dns.TypeSOA, Reply{AD: true, Answer: z.Signed(t, z.SOA(t))})
 	s.Set(z.Name, dns.TypeDNSKEY, Reply{AD: true, Answer: append(keys, z.Sign(t, 0, keys, z.From, z.Until))})
 	s.Set(z.Name, dns.TypeNS, Reply{AD: true, Answer: []dns.RR{z.NS(t)}})
+	s.Set(z.Name, dns.TypeA, Reply{AD: true, Answer: z.Signed(t, RR(t, z.Name+" 3600 IN A 192.0.2.1"))})
+	nsec := RR(t, z.Name+" 3600 IN NSEC "+below("\\000", z.Name)+" A NS SOA RRSIG NSEC DNSKEY")
+	s.Set(z.Name, dns.TypeAAAA, Reply{AD: true, Ns: append(z.Signed(t, z.SOA(t)), z.Signed(t, nsec)...)})
+}
+
+// Host serves name, a host inside z: a signed A record (192.0.2.1), and signed NODATA
+// proofs for AAAA, SOA and DS.
+func (s *Server) Host(t testing.TB, z *Zone, name string) {
+	nsec := RR(t, name+" 3600 IN NSEC "+below("\\000", name)+" A RRSIG NSEC")
+	nodata := Reply{AD: true, Ns: append(z.Signed(t, z.SOA(t)), z.Signed(t, nsec)...)}
+	s.Set(name, dns.TypeA, Reply{AD: true, Answer: z.Signed(t, RR(t, name+" 3600 IN A 192.0.2.1"))})
+	for _, qt := range []uint16{dns.TypeAAAA, dns.TypeSOA, dns.TypeDS} {
+		s.Set(name, qt, nodata)
+	}
+}
+
+// below returns label.name, handling the root.
+func below(label, name string) string {
+	if name == "." {
+		return label + "."
+	}
+	return label + "." + name
 }
 
 // Delegate publishes in parent a DS for key 0 of child, signed by parent.

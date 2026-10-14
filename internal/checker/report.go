@@ -47,6 +47,7 @@ type Report struct {
 	DNSSEC           string   `json:"dnssec"` // yes, no, broken, unknown
 	Summary          string   `json:"summary"`
 	Chain            []Step   `json:"chain"`
+	Lookups          []Lookup `json:"lookups"`
 	NS               []string `json:"ns"`
 	Resolver         Resolver `json:"resolver"`
 	CheckedAt        string   `json:"checked_at"`
@@ -130,15 +131,26 @@ func (r *Report) Text(w io.Writer, color bool) error {
 		for _, s := range r.Chain {
 			width = max(width, len(s.Zone))
 		}
-		last := r.Chain[len(r.Chain)-1].Zone
 		for _, s := range r.Chain {
 			m := mark[s.Result]
 			p("  %s %-*s  %s", paint(m.color, m.sym), width, s.Zone, s.Detail)
 			// Records are shown for the zone the verdict is about; JSON has all of them.
-			if s.Zone == last {
+			if r.Zone != nil && s.Zone == *r.Zone {
 				for _, rec := range s.Records {
 					p("      %s", paint("2", rec))
 				}
+			}
+		}
+	}
+
+	if len(r.Lookups) > 0 {
+		p("")
+		p("%s", paint("1", "Records of "+r.NormalizedDomain))
+		for _, l := range r.Lookups {
+			m := mark[l.Result]
+			p("  %s %-4s  %s", paint(m.color, m.sym), l.Type, l.Detail)
+			for _, rec := range l.Records {
+				p("      %s", paint("2", rec))
 			}
 		}
 	}

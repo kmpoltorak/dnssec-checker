@@ -59,6 +59,8 @@ Flags go before the domain. None are needed for a normal check.
 ```sh
 dnssec-checker example.com
 dnssec-checker --resolver 192.0.2.53 example.com
+dnssec-checker --resolver tls://192.0.2.53 example.com
+dnssec-checker --trust-anchor root.key example.com
 dnssec-checker --format json --timeout 3s --deadline 20s example.com
 dnssec-checker --help
 dnssec-checker --version
@@ -66,7 +68,8 @@ dnssec-checker --version
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--resolver` | first `nameserver` in `/etc/resolv.conf` | Resolver to fetch records from: an IP address with an optional port, e.g. `192.0.2.53`, `192.0.2.53:5353`, `2001:db8::53`, `[2001:db8::53]:53`. Host names are rejected. |
+| `--resolver` | first `nameserver` in `/etc/resolv.conf` | Resolver to fetch records from: an IP address with an optional port, e.g. `192.0.2.53`, `192.0.2.53:5353`, `2001:db8::53`, `[2001:db8::53]:53`. Prefix it with `tls://` for DNS over TLS (port 853 by default); the certificate must be valid for the IP address, or for a name after `#`: `tls://192.0.2.53#dns.example.net`. Host names are rejected. |
+| `--trust-anchor` | built-in IANA root keys | File with root trust anchors: DS or DNSKEY records for `.` in zone file format, e.g. `. IN DS 20326 8 2 E06D…`. DNSKEY records are turned into SHA-256 DS records. Useful after a root key rollover or for a test root. |
 | `--format` | `text` | `text` or `json` |
 | `--timeout` | `3s` | Time limit for one query attempt |
 | `--deadline` | `20s` | Time limit for the whole run |
@@ -114,6 +117,14 @@ whether the resolver validates or on the network path to it.
      insecure. If it shows the label is not a delegation (or is an empty non-terminal),
      the walk goes on with the same keys.
 4. **Zone apex.** The SOA record of the zone must be signed by one of its validated keys.
+5. **The name itself.** The A and AAAA answers for the name are validated too:
+   - records must be signed by the zone that the chain of trust reaches for their owner;
+   - an answer expanded from a wildcard (RRSIG label count below the owner's) needs a
+     signed proof that the name itself does not exist;
+   - each CNAME in an alias chain must be signed by its zone, even in another zone; a
+     CNAME synthesized from a DNAME is unsigned (RFC 6672), so the DNAME is validated;
+   - "no records" needs a signed NODATA proof and NXDOMAIN a signed proof that neither
+     the name nor a wildcard exists (RFC 4035 section 5.4, RFC 5155 sections 8.4-8.7).
 
 Every signature check covers the signer name, the key, the cryptographic signature and
 the validity period. An old or broken extra signature does not hide a good one.
@@ -121,16 +132,17 @@ the validity period. An old or broken extra signature does not hide a good one.
 Queries use EDNS0 with a 1232-byte buffer, DO=1, RD=1 and CD=1 (so the resolver passes
 data through even when its own validation fails). A truncated answer is retried over
 TCP, a transport error is retried once, and DNS errors are not retried. One run sends at
-most 64 packets and follows at most 8 aliases.
+most 128 packets and follows at most 8 aliases. With `tls://` every query goes over DNS
+over TLS (RFC 7858) instead.
 
 ## Status
 
 | Status | DNSSEC | When | Exit code |
 | --- | --- | --- | --- |
-| `SECURE` | yes | Every link from the root key to the zone's SOA verifies. | 0 |
-| `INSECURE` | no | A signed parent proves there is no DS for the zone or one of its ancestors, or every DS uses an algorithm or digest type the tool cannot validate (treated as insecure, RFC 4035 section 5.2). | 1 |
-| `BOGUS` | broken | A link fails: a DS that matches no DNSKEY, no DNSKEY at all, a missing, invalid, expired or not yet valid signature, or no DS without a valid signed proof. | 2 |
-| `INDETERMINATE` | unknown | The check could not finish: a query failed or timed out, the resolver answered SERVFAIL or REFUSED even with CD=1, or it does not pass DNSSEC records (no RRSIG for the root DNSKEY set). | 3 |
+| `SECURE` | yes | Every link from the root key to the zone's SOA verifies, and so do the name's A and AAAA answers. | 0 |
+| `INSECURE` | no | A signed parent proves there is no DS for the zone or one of its ancestors; or every DS uses an algorithm or digest type the tool cannot validate (treated as insecure, RFC 4035 section 5.2); or a proof uses NSEC3 with more than 150 iterations (treated as insecure, RFC 9276 section 3.2); or the zone is signed but the name's answer leads into an unsigned zone (for example a CNAME to an unsigned CDN). | 1 |
+| `BOGUS` | broken | A link fails: a DS that matches no DNSKEY, no DNSKEY at all, a missing, invalid, expired or not yet valid signature, no DS without a valid signed proof, or a name answer without a valid signature or proof. | 2 |
+| `INDETERMINATE` | unknown | The check could not finish: a query failed or timed out, the resolver answered SERVFAIL or REFUSED even with CD=1, or it does not pass DNSSEC records (no RRSIG for the root DNSKEY set). Also when a name answer fails validation but the resolver itself marks it valid (AD=1): the resolver or something on the way then changes answers, for example a DNS filter that drops records. | 3 |
 
 Exit code 64 means invalid command-line arguments; `--help` and `--version` exit with 0.
 Exit codes describe the DNSSEC result, not whether the name exists.
@@ -139,8 +151,9 @@ Supported algorithms: RSASHA1, RSASHA1-NSEC3-SHA1, RSASHA256, RSASHA512,
 ECDSAP256SHA256, ECDSAP384SHA384 and ED25519. Supported DS digest types: SHA-1, SHA-256
 and SHA-384.
 
-`name_exists` is reported separately from the status: an NXDOMAIN name in a signed zone
-is still `SECURE`.
+`name_exists` is reported separately: an NXDOMAIN name in a signed zone is `SECURE`
+when the non-existence is proven. If an A or AAAA query fails (for example a timeout),
+that answer is shown as not checked with a warning, and the status comes from the zone.
 
 ## The resolver's own answer
 
@@ -162,7 +175,8 @@ The text report starts with the verdict and a one-sentence explanation, then lis
 chain of trust with one line per link (`✔` valid, `–` not signed, `✘` broken, `?` could
 not check). The records that prove the result are printed under the steps for the
 checked zone: DS, DNSKEY (without key material), RRSIG, and NSEC/NSEC3 for an unsigned
-zone. Then come the zone, whether the name exists, aliases, name servers, the
+zone. A second section, "Records of <name>", shows the result for the A and AAAA
+answers with their records and signatures. Then come the zone, whether the name exists, aliases, name servers, the
 resolver's own answer, warnings and errors. Colors are used only when stdout is a
 terminal and `NO_COLOR` is not set.
 
@@ -170,27 +184,22 @@ JSON is a single object on stdout. Errors and usage messages go to stderr. Field
 `schema_version` (2), `domain`, `normalized_domain`, `zone`, `name_exists`,
 `alias_chain`, `status`, `dnssec` (`yes`, `no`, `broken`, `unknown`), `summary`,
 `chain` (each step has `zone`, `result` — `ok`, `insecure`, `fail` or `error` —
-`detail` and `records` for every zone), `ns`, `resolver` (`address`, `response`,
+`detail` and `records` for every zone), `lookups` (for A and AAAA: `name`, `type`,
+`result`, `detail`, `records`), `ns`, `resolver` (`address`, `response`,
 `agrees`), `checked_at` (RFC 3339, UTC), `duration_ms`, `queries`, `warnings`, `errors`.
 Unknown values are `null`. The report is printed even when the network fails.
 
 ## Limitations
 
-- Only the SOA and DNSKEY records of the zone are validated, not the records of the
-  input name itself (for example its A record or a wildcard answer).
+- Only A and AAAA answers of the name are validated, not other types such as MX or TXT.
 - Authoritative servers are not queried one by one; everything comes through one
   resolver. Only the first `nameserver` in `/etc/resolv.conf` is used. Systems without
-  that file (such as Windows) need `--resolver`.
-- NSEC3 records with a high iteration count are accepted; the RFC 9276 limits are not
-  applied.
-- Names with escaped characters in NSEC records are compared without unescaping.
-- Aliases are read from the CNAME records in the SOA answer. DNAME is not handled
-  separately.
-- Plain UDP/TCP only: no DNS over TLS or HTTPS.
-- An interrupt (Ctrl-C) can wait up to one `--timeout` for the current query, because
-  the DNS library honors only the deadline of a context.
-- The trust anchors are built in. After a root key rollover the tool needs an update.
-- RRSIG times are read as Unix seconds, which is correct until 2106.
+  that file (such as Windows) need `--resolver`, or use the Docker image.
+- When the resolver changes answers after validating them (some DNS filters and home
+  routers drop records), the result is `INDETERMINATE`; check with another resolver.
+- Only the root zone can have a trust anchor; trust anchors for other zones are not
+  supported.
+- DNS over HTTPS is not supported.
 
 ## Testing
 

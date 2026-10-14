@@ -40,7 +40,8 @@ func main() {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dnssec-checker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	resolver := fs.String("resolver", "", "resolver IP address with optional port, e.g. 192.0.2.53 or [2001:db8::53]:53\n(default: first nameserver in "+resolvConf+")")
+	resolver := fs.String("resolver", "", "resolver IP address with optional port, e.g. 192.0.2.53 or [2001:db8::53]:53;\nprefix with tls:// for DNS over TLS, e.g. tls://192.0.2.53 or tls://192.0.2.53#dns.example.net\n(default: first nameserver in "+resolvConf+")")
+	anchorFile := fs.String("trust-anchor", "", "file with root trust anchors (DS or DNSKEY records for \".\" in zone file format)\n(default: the built-in IANA root keys)")
 	format := fs.String("format", "text", "output format: text or json")
 	timeout := fs.Duration("timeout", 3*time.Second, "time limit for one query attempt")
 	deadline := fs.Duration("deadline", 20*time.Second, "time limit for the whole run")
@@ -94,10 +95,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitCodes[checker.Indeterminate]
 	}
 
+	ta := anchors
+	if *anchorFile != "" {
+		if ta, err = checker.LoadAnchors(*anchorFile); err != nil {
+			return fail("%v", err)
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, *deadline)
 	defer cancel()
 	rep, err := checker.Run(ctx, checker.Config{
-		Resolver: addr, Timeout: *timeout, WarnExpiry: *warnExpiry, Anchors: anchors,
+		Resolver: addr, Timeout: *timeout, WarnExpiry: *warnExpiry, Anchors: ta,
 	}, fs.Arg(0))
 	if err != nil {
 		return fail("%v", err)

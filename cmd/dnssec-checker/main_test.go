@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -137,6 +138,7 @@ func TestTextOutput(t *testing.T) {
 	for _, want := range []string{
 		"example.com.  DNSSEC: YES, valid (SECURE)", "Chain of trust", "✔ .", "✔ com.", "✔ example.com.",
 		"matches the IANA root trust anchor", "example.com. DS ", "(agrees)",
+		"Records of example.com.", "✔ A     1 record(s), signed by example.com.", "✔ AAAA  no AAAA records, proven by a signed NSEC record",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("text output lacks %q:\n%s", want, out)
@@ -144,5 +146,27 @@ func TestTextOutput(t *testing.T) {
 	}
 	if code != 0 || strings.Contains(out, "\x1b") {
 		t.Errorf("code %d, or colors when stdout is not a terminal", code)
+	}
+}
+
+func TestTrustAnchorFile(t *testing.T) {
+	srv := dnstest.Start(t)
+	root, _, _ := dnstest.Chain(t, srv, time.Now())
+	dir := t.TempDir()
+	good := filepath.Join(dir, "root.key")
+	os.WriteFile(good, []byte(root.Keys[0].String()+"\n"), 0o600)
+	// The built-in IANA anchors do not match the test root; the file does.
+	if code, _, errOut := runCLI(t, "--resolver", srv.Addr, "--trust-anchor", good, "example.com"); code != 0 {
+		t.Errorf("with the test root key: code %d, stderr %q", code, errOut)
+	}
+	if code, _, _ := runCLI(t, "--resolver", srv.Addr, "example.com"); code != 2 {
+		t.Errorf("with the IANA anchors: code %d, want 2 (BOGUS)", code)
+	}
+	bad := filepath.Join(dir, "bad.key")
+	os.WriteFile(bad, []byte("example.com. IN DS 1 13 2 AAAA\n"), 0o600)
+	for _, f := range []string{bad, filepath.Join(dir, "missing")} {
+		if code, out, errOut := runCLI(t, "--resolver", srv.Addr, "--trust-anchor", f, "example.com"); code != 64 || out != "" || errOut == "" {
+			t.Errorf("%s: code %d, stdout %q, stderr %q", f, code, out, errOut)
+		}
 	}
 }

@@ -167,7 +167,7 @@ func TestInsecure(t *testing.T) {
 	t.Run("NSEC3 at the delegation", func(t *testing.T) {
 		f := chain(t)
 		f.srv.ServeUnsigned(t, zone)
-		match := nsec3("com.", hashOf(zone), maxHash, 0, dns.TypeNS)
+		match := nsec3("com.", hashOf(zone), succ(hashOf(zone)), 0, dns.TypeNS)
 		f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: f.com.Signed(t, match)})
 		rep := f.run(t, zone)
 		wantStatus(t, rep, Insecure)
@@ -178,7 +178,7 @@ func TestInsecure(t *testing.T) {
 	t.Run("NSEC3 opt-out", func(t *testing.T) {
 		f := chain(t)
 		f.srv.ServeUnsigned(t, zone)
-		ce := nsec3("com.", hashOf("com."), maxHash, 0, dns.TypeNS, dns.TypeSOA)
+		ce := nsec3("com.", hashOf("com."), succ(hashOf("com.")), 0, dns.TypeNS, dns.TypeSOA)
 		cover := nsec3("com.", "00000000000000000000000000000000", maxHash, 1, dns.TypeNS)
 		f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: append(f.com.Signed(t, ce), f.com.Signed(t, cover)...)})
 		rep := f.run(t, zone)
@@ -285,7 +285,7 @@ func TestBogus(t *testing.T) {
 			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: f.example.Signed(t, nsec)})
 		}, zone, "no valid signed proof"},
 		{"NSEC3 without opt-out does not prove an unsigned delegation", func(t *testing.T, f fixture) {
-			ce := nsec3("com.", hashOf("com."), maxHash, 0, dns.TypeNS, dns.TypeSOA)
+			ce := nsec3("com.", hashOf("com."), succ(hashOf("com.")), 0, dns.TypeNS, dns.TypeSOA)
 			cover := nsec3("com.", "00000000000000000000000000000000", maxHash, 0, dns.TypeNS)
 			f.srv.Set(zone, dns.TypeDS, dnstest.Reply{Ns: append(f.com.Signed(t, ce), f.com.Signed(t, cover)...)})
 		}, zone, "no valid signed proof"},
@@ -515,10 +515,10 @@ func TestDenyDS(t *testing.T) {
 		{"empty non-terminal", msg(nsec("a.example.com.", "x.sub.example.com.", "A RRSIG NSEC")), notDelegation},
 		{"NSEC that covers a different name", msg(nsec("x.example.com.", "z.example.com.", "A RRSIG NSEC")), noProof},
 		{"NSEC owned after the name", msg(nsec("t.example.com.", "x.sub.example.com.", "A RRSIG NSEC")), noProof},
-		{"NSEC3 match without DS", msg(nsec3(zone, hashOf("sub.example.com."), maxHash, 0, dns.TypeNS)), insecureDelegation},
-		{"NSEC3 match with DS", msg(nsec3(zone, hashOf("sub.example.com."), maxHash, 0, dns.TypeNS, dns.TypeDS)), noProof},
+		{"NSEC3 match without DS", msg(nsec3(zone, hashOf("sub.example.com."), succ(hashOf("sub.example.com.")), 0, dns.TypeNS)), insecureDelegation},
+		{"NSEC3 match with DS", msg(nsec3(zone, hashOf("sub.example.com."), succ(hashOf("sub.example.com.")), 0, dns.TypeNS, dns.TypeDS)), noProof},
 		{"NSEC3 opt-out", msg(
-			nsec3(zone, hashOf(zone), maxHash, 0, dns.TypeNS, dns.TypeSOA),
+			nsec3(zone, hashOf(zone), succ(hashOf(zone)), 0, dns.TypeNS, dns.TypeSOA),
 			nsec3(zone, "00000000000000000000000000000000", maxHash, 1),
 		), insecureDelegation},
 		{"NSEC3 opt-out span without closest encloser", msg(nsec3(zone, "00000000000000000000000000000000", maxHash, 1)), noProof},
@@ -533,6 +533,17 @@ func TestDenyDS(t *testing.T) {
 	}
 }
 
+// succ returns the base32hex hash right after h, so that an NSEC3 record from h to succ(h)
+// matches h and covers nothing else.
+func succ(h string) string {
+	const digits = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+	i := strings.IndexByte(digits, h[len(h)-1])
+	if i == len(digits)-1 {
+		panic("hash ends in V; pick another test name")
+	}
+	return h[:len(h)-1] + string(digits[i+1])
+}
+
 // hashOf is the NSEC3 hash of name with SHA-1, no iterations and no salt.
 func hashOf(name string) string { return dns.HashName(name, dns.SHA1, 0, "") }
 
@@ -544,5 +555,20 @@ func nsec3(z, ownerHash, next string, flags uint8, types ...uint16) dns.RR {
 	return &dns.NSEC3{
 		Hdr:  dns.RR_Header{Name: strings.ToLower(ownerHash) + "." + z, Rrtype: dns.TypeNSEC3, Class: dns.ClassINET, Ttl: 3600},
 		Hash: dns.SHA1, Flags: flags, HashLength: 20, NextDomain: next, TypeBitMap: types,
+	}
+}
+
+func TestRunOverTLS(t *testing.T) {
+	f := chain(t)
+	addr, roots := f.srv.StartTLS(t)
+	cfg := f.config()
+	cfg.Resolver, cfg.TLSRoots = "tls://"+addr, roots
+	rep, err := Run(context.Background(), cfg, zone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, rep, Secure)
+	if rep.Queries[0].Transport != "tls" || rep.Resolver.Address != "tls://"+addr {
+		t.Errorf("transport %q, resolver %q", rep.Queries[0].Transport, rep.Resolver.Address)
 	}
 }
