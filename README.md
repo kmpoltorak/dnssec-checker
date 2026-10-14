@@ -62,10 +62,10 @@ Then check that it works:
 dnssec-checker --version
 ```
 
-There are no release tags yet, so `@latest` installs a recent commit on `main`. The Go
-module proxy caches it (and `@main` too), so right after a change it can serve an older
-commit; `dnssec-checker --version` shows which one you have. To get the newest commit,
-bypass the proxy:
+`@latest` installs the newest release tag (see
+[Releases](https://github.com/kmpoltorak/dnssec-checker/releases));
+`dnssec-checker --version` shows which version you have. To get the newest commit on
+`main` instead, bypass the Go module proxy, which caches branch names for a while:
 
 ```sh
 GOPROXY=direct go install github.com/kmpoltorak/dnssec-checker/cmd/dnssec-checker@main
