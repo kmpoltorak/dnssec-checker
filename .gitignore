@@ -10,3 +10,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Local settings for docker compose
+.env

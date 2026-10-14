@@ -2,8 +2,6 @@ package checker
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -133,22 +131,6 @@ func TestQueryHonoursDeadline(t *testing.T) {
 	}
 	if q.Error != context.DeadlineExceeded.Error() {
 		t.Errorf("error = %q", q.Error)
-	}
-}
-
-func TestSystemResolver(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "resolv.conf")
-	os.WriteFile(path, []byte("nameserver 2001:db8::53\nnameserver 192.0.2.53\n"), 0o600)
-	if got, err := SystemResolver(path); err != nil || got != "[2001:db8::53]:53" {
-		t.Errorf("SystemResolver = %q, %v", got, err)
-	}
-	os.WriteFile(path, []byte("# empty\n"), 0o600)
-	if _, err := SystemResolver(path); err == nil || !strings.Contains(err.Error(), "--resolver") {
-		t.Errorf("empty resolv.conf: %v", err)
-	}
-	if _, err := SystemResolver(filepath.Join(dir, "missing")); err == nil {
-		t.Error("missing file: want error")
 	}
 }
 

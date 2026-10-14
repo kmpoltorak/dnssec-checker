@@ -68,15 +68,20 @@ dnssec-checker --version
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--resolver` | first `nameserver` in `/etc/resolv.conf` | Resolver to fetch records from: an IP address with an optional port, e.g. `192.0.2.53`, `192.0.2.53:5353`, `2001:db8::53`, `[2001:db8::53]:53`. Prefix it with `tls://` for DNS over TLS (port 853 by default); the certificate must be valid for the IP address, or for a name after `#`: `tls://192.0.2.53#dns.example.net`. Host names are rejected. |
+| `--resolver` | `$DNSSEC_RESOLVER`, else `tls://9.9.9.9` (Quad9 over TLS) | Resolver to fetch records from: an IP address with an optional port, e.g. `192.0.2.53`, `192.0.2.53:5353`, `2001:db8::53`, `[2001:db8::53]:53`. Prefix it with `tls://` for DNS over TLS (port 853 by default); the certificate must be valid for the IP address, or for a name after `#`: `tls://192.0.2.53#dns.example.net`. Host names are rejected. |
 | `--trust-anchor` | built-in IANA root keys | File with root trust anchors: DS or DNSKEY records for `.` in zone file format, e.g. `. IN DS 20326 8 2 E06D…`. DNSKEY records are turned into SHA-256 DS records. Useful after a root key rollover or for a test root. |
 | `--format` | `text` | `text` or `json` |
 | `--timeout` | `3s` | Time limit for one query attempt |
 | `--deadline` | `20s` | Time limit for the whole run |
 | `--warn-expiry` | `168h` | Warn when a signature used for validation expires within this time (see [Warnings](#warnings)) |
 
-If no resolver is configured on the system, the tool exits with an error that asks for
-`--resolver`. It never falls back to a public DNS provider.
+By default the tool fetches records from Quad9 over DNS over TLS, not from the system
+resolver. Home routers and DNS filters (for example AdGuard Home or Pi-hole) often
+drop or change records, and Docker's DNS drops DNSSEC records altogether; then the
+result would be `INDETERMINATE` even for a correctly signed domain. Validation is always
+local, so the resolver only has to pass records through unchanged; it does see which
+names you check. To use another one, set `--resolver` or the `DNSSEC_RESOLVER`
+environment variable, for example `export DNSSEC_RESOLVER=tls://192.0.2.53`.
 
 In scripts, use the exit code (see [Status](#status)) or the JSON `dnssec` field:
 
@@ -92,6 +97,53 @@ The domain is trimmed, converted from IDN to ASCII (`bücher.example` becomes
 `a-z`, `0-9`, `-` and `_` (so `_443._tcp.example.com` works). The tool rejects URLs,
 ports, IP addresses, wildcards, empty labels, labels over 63 characters, names over
 253 characters, a numeric top-level label, and the root `.` on its own.
+
+## Web interface and Docker
+
+The same checks are available as a web page with a JSON API. With Docker:
+
+```sh
+cp .env.example .env   # optional: choose the resolver and port
+docker compose up -d --build
+```
+
+Then open http://127.0.0.1:8080. The page shows the verdict, the chain of trust and the
+records of the name, the same as the text report; `GET /api/check?domain=example.com`
+returns the JSON report, and `GET /healthz` answers `ok`.
+
+Settings in `.env` (see `.env.example`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DNSSEC_RESOLVER` | `tls://9.9.9.9` (Quad9 over TLS) | Resolver the server fetches records from, in `--resolver` format. Docker's built-in DNS drops DNSSEC records, so it cannot be used. Validation stays local; the resolver only fetches records. |
+| `PORT` | `8080` | Port on `127.0.0.1` where the page is published |
+
+Without Docker, run the server directly:
+
+```sh
+dnssec-checker serve --listen 127.0.0.1:8080 --resolver tls://192.0.2.53
+```
+
+`serve` flags: `--listen` (default `127.0.0.1:8080`), `--resolver` (default
+`$DNSSEC_RESOLVER`, else `tls://9.9.9.9`), `--trust-anchor` (default:
+the built-in IANA root keys), `--timeout` (3s), `--deadline` (20s per check) and
+`--max-checks` (4 checks at the same time; more get HTTP 429).
+`dnssec-checker health [URL]` exits with 0 when `/healthz` answers; the image uses it as
+its health check.
+
+Security:
+
+- Users only enter a domain. The resolver is set by whoever runs the server, so the page
+  cannot be used to send queries to other addresses.
+- Input is validated before a check starts; checks are limited in number and time; the
+  HTTP server has read, write and idle timeouts.
+- The page uses no JavaScript; responses carry a strict Content-Security-Policy,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`. Record data is HTML-escaped.
+- The container runs as a non-root user on a distroless image, with a read-only file
+  system, no Linux capabilities and `no-new-privileges`. Compose publishes the port on
+  `127.0.0.1` only; there is no login, so put a reverse proxy with access control in
+  front of it before exposing it to a network.
 
 ## How it decides
 
@@ -193,10 +245,9 @@ Unknown values are `null`. The report is printed even when the network fails.
 
 - Only A and AAAA answers of the name are validated, not other types such as MX or TXT.
 - Authoritative servers are not queried one by one; everything comes through one
-  resolver. Only the first `nameserver` in `/etc/resolv.conf` is used. Systems without
-  that file (such as Windows) need `--resolver`, or use the Docker image.
-- When the resolver changes answers after validating them (some DNS filters and home
-  routers drop records), the result is `INDETERMINATE`; check with another resolver.
+  resolver.
+- When the chosen resolver changes answers after validating them (some DNS filters and
+  home routers drop records), the result is `INDETERMINATE`; use another resolver.
 - Only the root zone can have a trust anchor; trust anchors for other zones are not
   supported.
 - DNS over HTTPS is not supported.
@@ -210,6 +261,7 @@ go test ./...
 go test -race ./...
 go build ./cmd/dnssec-checker
 go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+docker compose config --quiet && docker build .
 ```
 
 The tests run offline. `internal/dnstest` starts a fake recursive resolver on random
@@ -217,8 +269,10 @@ UDP and TCP ports on `127.0.0.1` and serves a synthetic chain `.` → `com.` →
 `example.com.`, signed with ECDSA P-256 keys generated during the test and checked
 against a test trust anchor. Signature validity uses an injected clock. No real keys or
 secrets are in the repository. Results do not depend on any public domain.
-`govulncheck` needs network access to the Go vulnerability database. CI runs the same
-commands on every push and pull request.
+The web handlers are tested against the same fake resolver. `govulncheck` needs network
+access to the Go vulnerability database. CI runs the same commands on every push and
+pull request, and also starts the image and checks `/healthz`, the page and a rejected
+request.
 
 ## Contributing
 

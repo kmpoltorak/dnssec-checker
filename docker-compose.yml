@@ -1,0 +1,16 @@
+# Web interface for dnssec-checker on http://127.0.0.1:${PORT:-8080}.
+# Copy .env.example to .env to choose the resolver and port.
+services:
+  dnssec-checker:
+    build: .
+    image: dnssec-checker:local
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080" # local only; put a reverse proxy in front to publish it
+    environment:
+      # Docker's built-in DNS drops DNSSEC records, so a resolver is set explicitly.
+      # Validation is local; the resolver only fetches records. Default: Quad9 over TLS.
+      DNSSEC_RESOLVER: ${DNSSEC_RESOLVER:-tls://9.9.9.9}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

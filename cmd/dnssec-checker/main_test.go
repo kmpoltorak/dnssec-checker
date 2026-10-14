@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,19 +59,26 @@ func TestHelpAndVersion(t *testing.T) {
 	}
 }
 
-func TestNoSystemResolver(t *testing.T) {
-	old := resolvConf
-	resolvConf = filepath.Join(t.TempDir(), "missing")
-	defer func() { resolvConf = old }()
-	code, out, errOut := runCLI(t, "example.com")
-	if code != 3 || out != "" || !strings.Contains(errOut, "--resolver") {
-		t.Errorf("code %d, stdout %q, stderr %q", code, out, errOut)
+func TestDefaultResolver(t *testing.T) {
+	report := func(env string) map[string]any {
+		t.Setenv("DNSSEC_RESOLVER", env)
+		// A 1 ms deadline keeps the run offline; only the chosen resolver matters here.
+		_, out, _ := runCLI(t, "--format", "json", "--deadline", "1ms", "example.com")
+		var rep map[string]any
+		json.Unmarshal([]byte(out), &rep)
+		return rep
+	}
+	if got := report("")["resolver"].(map[string]any)["address"]; got != "tls://9.9.9.9:853" {
+		t.Errorf("default resolver %v, want tls://9.9.9.9:853", got)
+	}
+	if got := report("192.0.2.53")["resolver"].(map[string]any)["address"]; got != "192.0.2.53:53" {
+		t.Errorf("DNSSEC_RESOLVER: %v", got)
 	}
 }
 
-// serve starts a fake resolver with the signed chain . -> com. -> example.com. and makes
+// serveChain starts a fake resolver with the signed chain . -> com. -> example.com. and makes
 // the CLI trust the test root.
-func serve(t *testing.T) (*dnstest.Server, *dnstest.Zone, *dnstest.Zone) {
+func serveChain(t *testing.T) (*dnstest.Server, *dnstest.Zone, *dnstest.Zone) {
 	srv := dnstest.Start(t)
 	root, com, example := dnstest.Chain(t, srv, time.Now())
 	old := anchors
@@ -99,7 +109,7 @@ func TestExitCodesAndJSON(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, com, example := serve(t)
+			srv, com, example := serveChain(t)
 			tt.setup(srv, com, example)
 			code, out, errOut := runCLI(t, "--resolver", srv.Addr, "--format", "json", "--timeout", "100ms", "example.com")
 			if code != tt.code || errOut != "" {
@@ -133,7 +143,7 @@ func TestExitCodesAndJSON(t *testing.T) {
 }
 
 func TestTextOutput(t *testing.T) {
-	srv, _, _ := serve(t)
+	srv, _, _ := serveChain(t)
 	code, out, _ := runCLI(t, "--resolver", srv.Addr, "example.com")
 	for _, want := range []string{
 		"example.com.  DNSSEC: YES, valid (SECURE)", "Chain of trust", "✔ .", "✔ com.", "✔ example.com.",
@@ -168,5 +178,75 @@ func TestTrustAnchorFile(t *testing.T) {
 		if code, out, errOut := runCLI(t, "--resolver", srv.Addr, "--trust-anchor", f, "example.com"); code != 64 || out != "" || errOut == "" {
 			t.Errorf("%s: code %d, stdout %q, stderr %q", f, code, out, errOut)
 		}
+	}
+}
+
+func TestServeFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"serve", "extra"},
+		{"serve", "--max-checks", "0"},
+		{"serve", "--timeout", "0s"},
+		{"serve", "--resolver", "dns.example.net"},
+		{"serve", "--bogus"},
+	} {
+		if code, _, _ := runCLI(t, args...); code != 64 {
+			t.Errorf("%q: code %d, want 64", args, code)
+		}
+	}
+	t.Setenv("DNSSEC_RESOLVER", "not-an-ip")
+	if code, _, errOut := runCLI(t, "serve"); code != 64 || !strings.Contains(errOut, "not-an-ip") {
+		t.Errorf("bad DNSSEC_RESOLVER: code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestServeAndHealth(t *testing.T) {
+	srv, _, _ := serveChain(t)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "--listen", addr, "--resolver", srv.Addr}, io.Discard, io.Discard)
+	}()
+	url := "http://" + addr + "/healthz"
+	deadline := time.Now().Add(5 * time.Second)
+	for runCLIHealth(url) != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if code := runCLIHealth(url); code != 0 {
+		t.Fatalf("health: %d", code)
+	}
+	resp, err := http.Get("http://" + addr + "/api/check?domain=example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep map[string]any
+	json.NewDecoder(resp.Body).Decode(&rep)
+	resp.Body.Close()
+	if rep["status"] != "SECURE" {
+		t.Errorf("API status %v", rep["status"])
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Errorf("serve exit code %d after shutdown", code)
+	}
+	if code := runCLIHealth(url); code != 1 {
+		t.Errorf("health after shutdown: %d, want 1", code)
+	}
+}
+
+func runCLIHealth(url string) int {
+	return run(context.Background(), []string{"health", url}, io.Discard, io.Discard)
+}
+
+func TestHealthStatus(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(500) }))
+	defer bad.Close()
+	if code := runCLIHealth(bad.URL); code != 1 {
+		t.Errorf("health with HTTP 500: %d, want 1", code)
 	}
 }

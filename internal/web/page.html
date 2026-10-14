@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{with .Report}}{{.NormalizedDomain}}: {{.Status}} · {{end}}DNSSEC checker</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>DNSSEC checker</h1>
+  <p class="lead">Validates the chain of trust of a domain from the IANA root key and shows the records that prove it.</p>
+
+  <form method="get" action="/" role="search">
+    <label for="domain">Domain</label>
+    <div class="row">
+      <input id="domain" name="domain" type="text" value="{{.Domain}}" placeholder="example.com"
+             required maxlength="1024" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus>
+      <button type="submit">Check</button>
+    </div>
+  </form>
+
+  {{with .Error}}<p class="error" role="alert">{{.}}</p>{{end}}
+
+  {{with .Report}}
+  <section class="verdict {{.DNSSEC}}" aria-live="polite">
+    <p class="name">{{.NormalizedDomain}}</p>
+    <p class="answer">DNSSEC: {{if eq .DNSSEC "yes"}}YES, valid{{else if eq .DNSSEC "no"}}NO, not signed{{else if eq .DNSSEC "broken"}}BROKEN, validation fails{{else}}UNKNOWN, could not be checked{{end}} <span class="status">{{.Status}}</span></p>
+    <p>{{.Summary}}</p>
+  </section>
+
+  {{if .Chain}}
+  <section>
+    <h2>Chain of trust</h2>
+    <p class="hint">Validated locally, link by link, from the IANA root key.</p>
+    <ol class="steps">
+      {{range .Chain}}
+      <li class="{{.Result}}">
+        <span class="mark" aria-label="{{.Result}}">{{mark .Result}}</span>
+        <span class="zone">{{.Zone}}</span>
+        <span class="detail">{{.Detail}}</span>
+        {{if and .Records (isZone $.Report .Zone)}}<details><summary>Records</summary><pre>{{range .Records}}{{.}}
+{{end}}</pre></details>{{end}}
+      </li>
+      {{end}}
+    </ol>
+  </section>
+  {{end}}
+
+  {{if .Lookups}}
+  <section>
+    <h2>Records of {{.NormalizedDomain}}</h2>
+    <ol class="steps">
+      {{range .Lookups}}
+      <li class="{{.Result}}">
+        <span class="mark" aria-label="{{.Result}}">{{mark .Result}}</span>
+        <span class="zone">{{.Type}}</span>
+        <span class="detail">{{.Detail}}</span>
+        {{if .Records}}<details><summary>Records</summary><pre>{{range .Records}}{{.}}
+{{end}}</pre></details>{{end}}
+      </li>
+      {{end}}
+    </ol>
+  </section>
+  {{end}}
+
+  <section>
+    <h2>Details</h2>
+    <dl>
+      <dt>Zone</dt><dd>{{with .Zone}}{{.}}{{else}}unknown{{end}}</dd>
+      <dt>Name exists</dt><dd>{{with .NameExists}}{{if deref .}}yes{{else}}no (NXDOMAIN){{end}}{{else}}unknown{{end}}</dd>
+      {{with .AliasChain}}<dt>Alias</dt><dd>{{range $i, $a := .}}{{if $i}} → {{end}}{{$a}}{{end}}</dd>{{end}}
+      {{with .NS}}<dt>Name servers</dt><dd>{{range $i, $n := .}}{{if $i}}, {{end}}{{$n}}{{end}}</dd>{{end}}
+      <dt>Resolver</dt><dd>{{.Resolver.Address}}{{with .Resolver.Response}}, its own answer: {{.Rcode}} AD={{if .AD}}1{{else}}0{{end}}{{end}}{{with .Resolver.Agrees}}{{if deref .}} (agrees){{else}} (disagrees){{end}}{{end}}</dd>
+      <dt>Checked</dt><dd>{{.CheckedAt}}, {{len .Queries}} queries, {{.DurationMS}} ms</dd>
+    </dl>
+    {{range .Warnings}}<p class="warning">Warning: {{.}}</p>{{end}}
+    {{range .Errors}}<p class="error">Error: {{.}}</p>{{end}}
+    <p class="hint"><a href="/api/check?domain={{.NormalizedDomain}}">This report as JSON</a></p>
+  </section>
+  {{end}}
+</main>
+</body>
+</html>
