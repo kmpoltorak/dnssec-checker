@@ -102,28 +102,35 @@ func TestSecure(t *testing.T) {
 func TestNameInZone(t *testing.T) {
 	t.Run("NODATA below the apex", func(t *testing.T) {
 		f := chain(t)
-		f.srv.Set("www.example.com.", dns.TypeSOA, dnstest.Reply{Ns: f.example.Signed(t, f.example.SOA(t))})
+		nsec := dnstest.RR(t, "www.example.com. 3600 IN NSEC \\000.www.example.com. TXT RRSIG NSEC")
+		setAll(f.srv, "www.example.com.", negative(t, f.example, dns.RcodeSuccess, nsec))
 		rep := f.run(t, "www.example.com")
 		wantStatus(t, rep, Secure)
+		wantLookups(t, rep, "A:ok", "AAAA:ok")
 		if *rep.Zone != zone || !*rep.NameExists {
 			t.Errorf("zone %v, exists %v", *rep.Zone, *rep.NameExists)
 		}
 	})
 	t.Run("NXDOMAIN", func(t *testing.T) {
 		f := chain(t)
-		f.srv.Set("nope.example.com.", dns.TypeSOA, dnstest.Reply{Rcode: dns.RcodeNameError, Ns: f.example.Signed(t, f.example.SOA(t))})
+		nsec := dnstest.RR(t, "example.com. 3600 IN NSEC www.example.com. A NS SOA RRSIG NSEC DNSKEY")
+		setAll(f.srv, "nope.example.com.", negative(t, f.example, dns.RcodeNameError, nsec))
 		rep := f.run(t, "nope.example.com")
-		wantStatus(t, rep, Secure) // the zone status is independent of the name
+		wantStatus(t, rep, Secure) // signed non-existence is a valid DNSSEC answer
+		wantLookups(t, rep, "A:ok", "AAAA:ok")
 		if *rep.Zone != zone || *rep.NameExists {
 			t.Errorf("zone %v, exists %v", *rep.Zone, *rep.NameExists)
 		}
 	})
 	t.Run("no authority section, walks to the parent", func(t *testing.T) {
 		f := chain(t)
+		f.srv.Host(t, f.example, "a.b.example.com.")
+		f.srv.NoDS(t, f.example, "b.example.com.", "TXT RRSIG NSEC")
 		f.srv.Set("a.b.example.com.", dns.TypeSOA, dnstest.Reply{})
 		f.srv.Set("b.example.com.", dns.TypeSOA, dnstest.Reply{})
 		rep := f.run(t, "a.b.example.com")
 		wantStatus(t, rep, Secure)
+		wantLookups(t, rep, "A:ok", "AAAA:ok")
 		if *rep.Zone != zone {
 			t.Errorf("zone %v", *rep.Zone)
 		}
@@ -379,12 +386,26 @@ func TestResolver(t *testing.T) {
 func TestAliases(t *testing.T) {
 	t.Run("alias to another zone", func(t *testing.T) {
 		f := chain(t)
+		net := dnstest.NewZone(t, "net.", now, 257)
+		exnet := dnstest.NewZone(t, "example.net.", now, 257)
+		f.srv.Serve(t, net)
+		f.srv.Serve(t, exnet)
+		f.srv.Delegate(t, f.root, net)
+		f.srv.Delegate(t, net, exnet)
+		f.srv.Host(t, exnet, "www.example.net.")
+		f.srv.NoDS(t, f.example, "www.example.com.", "CNAME RRSIG NSEC")
+		for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+			r := f.srv.Get("www.example.net.", qt)
+			r.Answer = append(f.example.Signed(t, dnstest.RR(t, "www.example.com. 300 IN CNAME www.example.net.")), r.Answer...)
+			f.srv.Set("www.example.com.", qt, r)
+		}
 		f.srv.Set("www.example.com.", dns.TypeSOA, dnstest.Reply{
 			Answer: []dns.RR{dnstest.RR(t, "www.example.com. 300 IN CNAME www.example.net.")},
 			Ns:     []dns.RR{dnstest.RR(t, "example.net. 900 IN SOA ns1.example.net. h.example.net. 1 1 1 1 1")},
 		})
 		rep := f.run(t, "www.example.com")
 		wantStatus(t, rep, Secure)
+		wantLookups(t, rep, "A:ok", "AAAA:ok")
 		if *rep.Zone != zone || !slices.Equal(rep.AliasChain, []string{"www.example.net."}) || !*rep.NameExists {
 			t.Errorf("zone %v, alias %v", *rep.Zone, rep.AliasChain)
 		}

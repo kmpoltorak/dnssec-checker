@@ -241,6 +241,10 @@ func TestAliasAcrossZones(t *testing.T) {
 		if !strings.Contains(rep.Summary, "www.example.org. is in an unsigned zone (no DS for org.)") {
 			t.Errorf("summary %q", rep.Summary)
 		}
+		f.srv.Set("www.example.com.", dns.TypeA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+		rep = f.run(t, "www.example.com")
+		wantStatus(t, rep, Indeterminate)
+		wantLookups(t, rep, "A:error", "AAAA:insecure")
 	})
 	t.Run("unsigned CNAME", func(t *testing.T) {
 		f := chain(t)
@@ -270,13 +274,65 @@ func TestAliasAcrossZones(t *testing.T) {
 	})
 }
 
-func TestLookupErrorIsAWarning(t *testing.T) {
+func TestLookupErrorIsIndeterminate(t *testing.T) {
+	for i, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		for _, tt := range []struct {
+			name  string
+			reply dnstest.Reply
+		}{
+			{"timeout", dnstest.Reply{Drop: -1}},
+			{"SERVFAIL", dnstest.Reply{Rcode: dns.RcodeServerFailure}},
+			{"REFUSED", dnstest.Reply{Rcode: dns.RcodeRefused}},
+		} {
+			t.Run(dns.TypeToString[qt]+"/"+tt.name, func(t *testing.T) {
+				f := chain(t)
+				f.srv.Set(zone, qt, tt.reply)
+				rep := f.run(t, zone)
+				wantStatus(t, rep, Indeterminate)
+				want := []string{"A:ok", "AAAA:ok"}
+				want[i] = dns.TypeToString[qt] + ":error"
+				wantLookups(t, rep, want...)
+				wantChain(t, rep, ".:ok", "com.:ok", "example.com.:ok", "example.com.:ok")
+				if !strings.Contains(rep.Summary, "could not be checked") || !strings.Contains(rep.Summary, dns.TypeToString[qt]+" answer") {
+					t.Errorf("summary %q", rep.Summary)
+				}
+				if len(rep.Warnings) != 1 || !strings.Contains(rep.Warnings[0], dns.TypeToString[qt]+" records") {
+					t.Errorf("warnings %v", rep.Warnings)
+				}
+				if len(rep.Errors) == 0 {
+					t.Error("missing query error")
+				}
+			})
+		}
+	}
+}
+
+func TestLookupFailureWithIncompleteAnswer(t *testing.T) {
+	for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		t.Run(dns.TypeToString[qt], func(t *testing.T) {
+			f := chain(t)
+			f.srv.Set(zone, dns.TypeA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+			f.srv.Set(zone, dns.TypeAAAA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+			// The other answer is unavailable; this one has no signed NODATA proof.
+			f.srv.Set(zone, qt, negative(t, f.example, dns.RcodeSuccess))
+			rep := f.run(t, zone)
+			wantStatus(t, rep, Bogus)
+			if !strings.Contains(rep.Summary, dns.TypeToString[qt]+" answer") {
+				t.Errorf("summary %q", rep.Summary)
+			}
+		})
+	}
+}
+
+func TestBothLookupsIncomplete(t *testing.T) {
 	f := chain(t)
-	f.srv.Set(zone, dns.TypeAAAA, dnstest.Reply{Drop: -1})
+	for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		f.srv.Set(zone, qt, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+	}
 	rep := f.run(t, zone)
-	wantStatus(t, rep, Secure)
-	wantLookups(t, rep, "A:ok", "AAAA:error")
-	if len(rep.Warnings) != 1 || !strings.Contains(rep.Warnings[0], "AAAA records") {
+	wantStatus(t, rep, Indeterminate)
+	wantLookups(t, rep, "A:error", "AAAA:error")
+	if len(rep.Warnings) != 2 {
 		t.Errorf("warnings %v", rep.Warnings)
 	}
 }
