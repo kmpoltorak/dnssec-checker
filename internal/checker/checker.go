@@ -298,6 +298,7 @@ func (r *run) descend(ctx context.Context, name string, t trust) (next trust, nx
 			r.step(name, StepFail, "DS in "+t.zone+" is not validly signed: "+why, ev)
 			return stop(Bogus, fmt.Sprintf("The DS record of %s in %s is not validly signed (%s), so DNSSEC validation fails.", name, t.zone, why)), false
 		}
+		r.warnExpiry(name, sig)
 		keys, st, why := r.zoneKeys(ctx, name, t.zone, dss, append(ev, sigLine(sig, r.now)))
 		if st != "" {
 			return stop(st, why), false
@@ -422,11 +423,15 @@ func verify(rrs []dns.RR, owner string, t uint16, signer string, keys []*dns.DNS
 // warnExpiry warns about a signature that expires within --warn-expiry and in less than
 // a quarter of its validity period. The second condition keeps online signers, which
 // issue short-lived signatures on every answer, from always warning.
+// ponytail: track selected NSEC/NSEC3 proofs before adding proof-expiry alerts.
 func (r *run) warnExpiry(zone string, s *dns.RRSIG) {
 	inc, exp := sigTime(s.Inception, r.now), sigTime(s.Expiration, r.now)
 	if left := exp.Sub(r.now); left < r.cfg.WarnExpiry && left < exp.Sub(inc)/4 {
-		r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the %s signature of %s (key %d) expires in %s, at %s",
-			dns.TypeToString[s.TypeCovered], zone, s.KeyTag, left.Round(time.Minute), ts(s.Expiration, r.now)))
+		warning := fmt.Sprintf("the %s signature of %s (key %d) expires in %s, at %s",
+			dns.TypeToString[s.TypeCovered], zone, s.KeyTag, left.Round(time.Minute), ts(s.Expiration, r.now))
+		if !slices.Contains(r.rep.Warnings, warning) {
+			r.rep.Warnings = append(r.rep.Warnings, warning)
+		}
 	}
 }
 

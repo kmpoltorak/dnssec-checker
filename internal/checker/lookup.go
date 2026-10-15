@@ -123,6 +123,7 @@ func (r *run) positive(ctx context.Context, l *Lookup, m *dns.Msg, owner string,
 		l.Result, l.Detail = StepFail, fmt.Sprintf("the %s records of %s are not validly signed (%s)", l.Type, owner, why)
 		return
 	}
+	r.warnExpiry(owner, sig)
 	l.Records = append(l.Records, sigLine(sig, r.now))
 	l.Result, l.Detail = StepOK, fmt.Sprintf("%d record(s), signed by %s key %d", len(set), z.zone, sig.KeyTag)
 	if labels := dns.SplitDomainName(owner); int(sig.Labels) < len(labels) {
@@ -153,6 +154,7 @@ func (r *run) alias(ctx context.Context, l *Lookup, m *dns.Msg, owner string, cn
 			l.Result, l.Detail = StepFail, fmt.Sprintf("the DNAME at %s is not validly signed (%s)", d.Hdr.Name, why)
 			return "", false
 		}
+		r.warnExpiry(d.Hdr.Name, sig)
 		l.Records = append(l.Records, sigLine(sig, r.now))
 		return "DNAME " + strings.ToLower(d.Hdr.Name), true
 	}
@@ -165,6 +167,7 @@ func (r *run) alias(ctx context.Context, l *Lookup, m *dns.Msg, owner string, cn
 		l.Result, l.Detail = StepFail, fmt.Sprintf("the CNAME at %s is not validly signed (%s)", owner, why)
 		return "", false
 	}
+	r.warnExpiry(owner, sig)
 	l.Records = append(l.Records, sigLine(sig, r.now))
 	return "CNAME", true
 }
