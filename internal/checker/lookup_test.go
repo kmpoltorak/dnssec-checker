@@ -3,6 +3,7 @@ package checker
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kmpoltorak/dnssec-checker/internal/dnstest"
 	"github.com/miekg/dns"
@@ -187,6 +188,57 @@ func TestWildcard(t *testing.T) {
 		wantStatus(t, rep, Bogus)
 		wantLookups(t, rep, "A:fail", "AAAA:ok")
 	})
+}
+
+func TestWildcardCNAME(t *testing.T) {
+	for _, proof := range []string{"NSEC", "NSEC3", "missing", "unsigned", "invalid signature", "expired", "unrelated", "existing name"} {
+		t.Run(proof, func(t *testing.T) {
+			f := chain(t)
+			f.srv.Host(t, f.example, "www.example.com.")
+			f.srv.NoDS(t, f.example, "a.example.com.", "TXT RRSIG NSEC")
+			f.srv.Set("a.example.com.", dns.TypeSOA, dnstest.Reply{Ns: f.example.Signed(t, f.example.SOA(t))})
+			alias := f.example.Signed(t, dnstest.RR(t, "*.example.com. 300 IN CNAME www.example.com."))
+			for _, rr := range alias {
+				rr.Header().Name = "a.example.com."
+			}
+			nsec := dnstest.RR(t, "*.example.com. 3600 IN NSEC www.example.com. CNAME RRSIG NSEC")
+			signed := f.example.Signed(t, nsec)
+			switch proof {
+			case "NSEC3":
+				signed = f.example.Signed(t, nsec3(zone, "00000000000000000000000000000000", maxHash, 0))
+			case "missing":
+				signed = nil
+			case "unsigned":
+				signed = []dns.RR{nsec}
+			case "invalid signature":
+				signed[1].(*dns.RRSIG).Signature = "AAAA"
+			case "expired":
+				signed = []dns.RR{nsec, f.example.Sign(t, 1, []dns.RR{nsec}, now.Add(-2*time.Hour), now.Add(-time.Hour))}
+			case "unrelated":
+				signed = f.example.Signed(t, dnstest.RR(t, "x.example.com. 3600 IN NSEC z.example.com. A RRSIG NSEC"))
+			case "existing name":
+				signed = f.example.Signed(t, dnstest.RR(t, "a.example.com. 3600 IN NSEC b.example.com. TXT RRSIG NSEC"))
+			}
+			for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+				reply := f.srv.Get("www.example.com.", qt)
+				reply.AD = false
+				reply.Answer = append(append([]dns.RR{}, alias...), reply.Answer...)
+				reply.Ns = append(reply.Ns, signed...)
+				f.srv.Set("a.example.com.", qt, reply)
+			}
+			rep := f.run(t, "a.example.com")
+			if proof == "NSEC" || proof == "NSEC3" {
+				wantStatus(t, rep, Secure)
+				wantLookups(t, rep, "A:ok", "AAAA:ok")
+			} else {
+				wantStatus(t, rep, Bogus)
+				wantLookups(t, rep, "A:fail", "AAAA:fail")
+				if !strings.Contains(lookupDetail(rep, "A"), "no valid signed proof") {
+					t.Errorf("detail %q", lookupDetail(rep, "A"))
+				}
+			}
+		})
+	}
 }
 
 func TestAliasAcrossZones(t *testing.T) {

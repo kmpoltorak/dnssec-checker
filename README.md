@@ -201,6 +201,8 @@ whether the resolver validates or on the network path to it.
      signed proof that the name itself does not exist;
    - each CNAME in an alias chain must be signed by its zone, even in another zone; a
      CNAME synthesized from a DNAME is unsigned (RFC 6672), so the DNAME is validated;
+   - a CNAME expanded from a wildcard needs the same signed proof of non-existence as
+     a wildcard A or AAAA answer; a signature on the CNAME alone is not enough;
    - "no records" needs a signed NODATA proof and NXDOMAIN a signed proof that neither
      the name nor a wildcard exists (RFC 4035 section 5.4, RFC 5155 sections 8.4-8.7).
 
@@ -304,6 +306,8 @@ The web handlers are tested against the same fake resolver. `govulncheck` needs 
 access to the Go vulnerability database. Regression tests cover A and AAAA timeouts,
 SERVFAIL and REFUSED after successful zone validation, the CLI exit code and JSON,
 and the web page and API verdicts for incomplete checks.
+Wildcard CNAME tests cover signed NSEC/NSEC3 proofs, missing, unsigned, expired and
+unrelated proofs, and replay of a wildcard alias at an existing name.
 CI runs the same commands on every push and
 pull request, and also starts the image and checks `/healthz`, the page and a rejected
 request.

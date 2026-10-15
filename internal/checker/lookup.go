@@ -125,6 +125,11 @@ func (r *run) positive(ctx context.Context, l *Lookup, m *dns.Msg, owner string,
 	}
 	l.Records = append(l.Records, sigLine(sig, r.now))
 	l.Result, l.Detail = StepOK, fmt.Sprintf("%d record(s), signed by %s key %d", len(set), z.zone, sig.KeyTag)
+	r.wildcard(l, m, owner, z, sig)
+}
+
+// wildcard checks the proof required for any wildcard expansion, including CNAMEs.
+func (r *run) wildcard(l *Lookup, m *dns.Msg, owner string, z trust, sig *dns.RRSIG) bool {
 	if labels := dns.SplitDomainName(owner); int(sig.Labels) < len(labels) {
 		// Expanded from a wildcard: the name itself must be proven not to exist.
 		ce := dns.Fqdn(strings.Join(labels[len(labels)-int(sig.Labels):], "."))
@@ -132,10 +137,11 @@ func (r *run) positive(ctx context.Context, l *Lookup, m *dns.Msg, owner string,
 		l.Records = append(l.Records, p.ev...)
 		if !p.noExactMatch(owner, ce) {
 			l.Result, l.Detail = StepFail, fmt.Sprintf("the answer is expanded from *.%s, but there is no valid signed proof that %s does not exist", ce, owner)
-			return
+			return false
 		}
 		l.Detail += fmt.Sprintf(", expanded from the wildcard *.%s", ce)
 	}
+	return true
 }
 
 // alias validates the CNAME at owner. A CNAME synthesized from a DNAME is unsigned
@@ -166,6 +172,9 @@ func (r *run) alias(ctx context.Context, l *Lookup, m *dns.Msg, owner string, cn
 		return "", false
 	}
 	l.Records = append(l.Records, sigLine(sig, r.now))
+	if !r.wildcard(l, m, owner, z, sig) {
+		return "", false
+	}
 	return "CNAME", true
 }
 
