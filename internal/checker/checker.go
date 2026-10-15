@@ -169,11 +169,12 @@ func Run(ctx context.Context, cfg Config, domain string) (*Report, error) {
 	} else {
 		r.rep.Zone = &zone
 		r.rep.Status, r.rep.Summary = r.validate(ctx, zone)
+		zoneStatus := r.rep.Status
 		if r.rep.Status == Secure {
 			r.checkName(ctx, name, zone)
 		}
 		r.nameServers(ctx, zone)
-		r.resolverView(ctx, zone)
+		r.resolverView(ctx, zone, zoneStatus)
 	}
 	if ctx.Err() != nil {
 		r.rep.Errors = append(r.rep.Errors, fmt.Sprintf("run stopped early (%v); the report is partial", ctx.Err()))
@@ -441,15 +442,15 @@ func (r *run) nameServers(ctx context.Context, zone string) {
 }
 
 // resolverView records the resolver's own validation (CD=0) of the zone SOA. It is only
-// compared with the local result and never changes it.
-func (r *run) resolverView(ctx context.Context, zone string) {
+// compared with the local validation of that zone, not with its A/AAAA lookups.
+func (r *run) resolverView(ctx context.Context, zone string, zoneStatus Status) {
 	q := r.record(r.c.query(ctx, zone, dns.TypeSOA, false))
 	r.rep.Resolver.Response = q.Response
 	if q.Response == nil {
 		return
 	}
 	var agrees bool
-	switch r.rep.Status {
+	switch zoneStatus {
 	case Secure:
 		agrees = q.Response.AD
 	case Insecure:
@@ -461,7 +462,7 @@ func (r *run) resolverView(ctx context.Context, zone string) {
 	}
 	r.rep.Resolver.Agrees = &agrees
 	if !agrees {
-		r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the resolver's own answer (%s, AD=%d) does not match the local result; it may not validate DNSSEC, or its cache differs", q.Response.Rcode, b2i(q.Response.AD)))
+		r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the resolver's own SOA answer (%s, AD=%d) does not match the local zone result; it may not validate DNSSEC, or its cache differs", q.Response.Rcode, b2i(q.Response.AD)))
 	}
 }
 

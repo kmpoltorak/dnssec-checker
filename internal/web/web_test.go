@@ -91,7 +91,7 @@ func TestIncompleteLookupPageAndAPI(t *testing.T) {
 	ts, srv := setup(t, 4)
 	srv.Set("example.com.", dns.TypeAAAA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
 	resp, body := get(t, ts, "/?domain=example.com")
-	for _, want := range []string{`class="verdict unknown"`, "INDETERMINATE", "AAAA answer for example.com. could not be checked", "SOA signed by key"} {
+	for _, want := range []string{`class="verdict unknown"`, "INDETERMINATE", "AAAA answer for example.com. could not be checked", "SOA signed by key", "its own SOA answer: NOERROR AD=1", "(agrees)"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("incomplete result page lacks %q", want)
 		}
@@ -106,6 +106,9 @@ func TestIncompleteLookupPageAndAPI(t *testing.T) {
 	}
 	if rep.Status != checker.Indeterminate || rep.DNSSEC != "unknown" {
 		t.Errorf("status %s, dnssec %s", rep.Status, rep.DNSSEC)
+	}
+	if rep.Resolver.Agrees == nil || !*rep.Resolver.Agrees {
+		t.Errorf("SOA comparison %v", rep.Resolver.Agrees)
 	}
 }
 

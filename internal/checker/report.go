@@ -69,7 +69,7 @@ type Step struct {
 type Resolver struct {
 	Address  string    `json:"address"`
 	Response *Response `json:"response"`
-	Agrees   *bool     `json:"agrees"`
+	Agrees   *bool     `json:"agrees"` // comparison with local zone validation, excluding name lookups
 }
 
 type Query struct {
@@ -174,7 +174,7 @@ func (r *Report) Text(w io.Writer, color bool) error {
 	}
 	resolver := r.Resolver.Address
 	if q := r.Resolver.Response; q != nil {
-		resolver += fmt.Sprintf(", its own answer: %s AD=%d", q.Rcode, b2i(q.AD))
+		resolver += fmt.Sprintf(", its own SOA answer: %s AD=%d", q.Rcode, b2i(q.AD))
 		for _, e := range q.EDE {
 			resolver += fmt.Sprintf(" EDE %d (%s)", e.Code, e.Name)
 		}
