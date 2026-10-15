@@ -355,6 +355,34 @@ func TestMixedSupportedAndUnsupportedDS(t *testing.T) {
 }
 
 func TestResolver(t *testing.T) {
+	t.Run("SOA agrees despite a bogus A answer", func(t *testing.T) {
+		f := chain(t)
+		f.srv.Set(zone, dns.TypeA, dnstest.Reply{Answer: []dns.RR{dnstest.RR(t, "example.com. 3600 IN A 192.0.2.1")}})
+		rep := f.run(t, zone)
+		wantStatus(t, rep, Bogus)
+		if rep.Resolver.Agrees == nil || !*rep.Resolver.Agrees || len(rep.Warnings) != 0 {
+			t.Errorf("resolver %+v, warnings %v", rep.Resolver, rep.Warnings)
+		}
+	})
+	t.Run("SOA comparison survives an incomplete lookup", func(t *testing.T) {
+		for _, disagrees := range []bool{false, true} {
+			f := chain(t)
+			f.srv.Set(zone, dns.TypeAAAA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+			if disagrees {
+				f.srv.SetCD(zone, dns.TypeSOA, f.srv.Get(zone, dns.TypeSOA))
+				f.srv.Set(zone, dns.TypeSOA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+			}
+			rep := f.run(t, zone)
+			wantStatus(t, rep, Indeterminate)
+			wantWarnings := 1
+			if disagrees {
+				wantWarnings++
+			}
+			if rep.Resolver.Agrees == nil || *rep.Resolver.Agrees == disagrees || len(rep.Warnings) != wantWarnings {
+				t.Errorf("disagrees=%t: resolver %+v, warnings %v", disagrees, rep.Resolver, rep.Warnings)
+			}
+		}
+	})
 	t.Run("strips RRSIG", func(t *testing.T) {
 		f := chain(t)
 		f.srv.Set(".", dns.TypeDNSKEY, dnstest.Reply{Answer: f.root.KeySet()})

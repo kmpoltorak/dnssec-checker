@@ -241,6 +241,9 @@ func TestAliasAcrossZones(t *testing.T) {
 		if !strings.Contains(rep.Summary, "www.example.org. is in an unsigned zone (no DS for org.)") {
 			t.Errorf("summary %q", rep.Summary)
 		}
+		if rep.Resolver.Agrees == nil || !*rep.Resolver.Agrees || len(rep.Warnings) != 0 {
+			t.Errorf("signed SOA agrees despite unsigned alias target: resolver %+v, warnings %v", rep.Resolver, rep.Warnings)
+		}
 		f.srv.Set("www.example.com.", dns.TypeA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
 		rep = f.run(t, "www.example.com")
 		wantStatus(t, rep, Indeterminate)

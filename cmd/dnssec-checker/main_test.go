@@ -155,6 +155,7 @@ func TestTextOutput(t *testing.T) {
 		"example.com.  DNSSEC: YES, valid (SECURE)", "Chain of trust", "✔ .", "✔ com.", "✔ example.com.",
 		"the chain of trust to example.com. and the A and AAAA answers for example.com. validate.",
 		"matches the IANA root trust anchor", "example.com. DS ", "(agrees)",
+		"its own SOA answer: NOERROR AD=1",
 		"Records of example.com.", "✔ A     1 record(s), signed by example.com.", "✔ AAAA  no AAAA records, proven by a signed NSEC record",
 	} {
 		if !strings.Contains(out, want) {

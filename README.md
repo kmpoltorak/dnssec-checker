@@ -242,8 +242,11 @@ incomplete answer; an incomplete answer takes precedence over an unsigned answer
 
 After the local check, the tool sends one normal (CD=0) SOA query and shows the
 resolver's RCODE, AD bit and Extended DNS Errors, and whether that agrees with the local
-result (AD=1 for `SECURE`, AD=0 for `INSECURE`, SERVFAIL for `BOGUS`). A disagreement is
-a warning; it never changes the status.
+validation of the zone's SOA and chain of trust (AD=1 for `SECURE`, AD=0 for `INSECURE`,
+SERVFAIL for `BOGUS`). This comparison, including JSON `resolver.agrees`, excludes the
+name's A/AAAA results: a valid zone can agree even when an address answer is broken,
+unsigned or unavailable. An indeterminate zone result cannot be compared and gives
+`resolver.agrees: null`. A disagreement is a warning; it never changes the status.
 
 ## Warnings
 

@@ -71,7 +71,7 @@
       <dt>Name exists</dt><dd>{{with .NameExists}}{{if deref .}}yes{{else}}no (NXDOMAIN){{end}}{{else}}unknown{{end}}</dd>
       {{with .AliasChain}}<dt>Alias</dt><dd>{{range $i, $a := .}}{{if $i}} → {{end}}{{$a}}{{end}}</dd>{{end}}
       {{with .NS}}<dt>Name servers</dt><dd>{{range $i, $n := .}}{{if $i}}, {{end}}{{$n}}{{end}}</dd>{{end}}
-      <dt>Resolver</dt><dd>{{.Resolver.Address}}{{with .Resolver.Response}}, its own answer: {{.Rcode}} AD={{if .AD}}1{{else}}0{{end}}{{end}}{{with .Resolver.Agrees}}{{if deref .}} (agrees){{else}} (disagrees){{end}}{{end}}</dd>
+      <dt>Resolver</dt><dd>{{.Resolver.Address}}{{with .Resolver.Response}}, its own SOA answer: {{.Rcode}} AD={{if .AD}}1{{else}}0{{end}}{{end}}{{with .Resolver.Agrees}}{{if deref .}} (agrees){{else}} (disagrees){{end}}{{end}}</dd>
       <dt>Checked</dt><dd>{{.CheckedAt}}, {{len .Queries}} queries, {{.DurationMS}} ms</dd>
     </dl>
     {{range .Warnings}}<p class="warning">Warning: {{.}}</p>{{end}}
