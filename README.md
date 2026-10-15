@@ -11,7 +11,7 @@ records that prove the answer.
 ```text
 $ dnssec-checker example.com
 example.com.  DNSSEC: YES, valid (SECURE)
-DNSSEC is enabled and valid: every link from the IANA root key to the SOA record of example.com. verifies.
+DNSSEC is enabled and valid: the chain of trust to example.com. and the A and AAAA answers for example.com. validate.
 
 Chain of trust (validated locally from the IANA root key)
   ✔ .             DNSKEY 20326 matches the IANA root trust anchor; DNSKEY set signed by key 20326
@@ -230,8 +230,13 @@ ECDSAP256SHA256, ECDSAP384SHA384 and ED25519. Supported DS digest types: SHA-1, 
 and SHA-384.
 
 `name_exists` is reported separately: an NXDOMAIN name in a signed zone is `SECURE`
-when the non-existence is proven. If an A or AAAA query fails (for example a timeout),
-that answer is shown as not checked with a warning, and the status comes from the zone.
+when the non-existence is proven. `SECURE` requires successful validation of the zone
+and both A and AAAA answers, including signed proofs of absence when there are no
+records. If either answer cannot be checked (for example because of a timeout,
+SERVFAIL or REFUSED), the overall result is `INDETERMINATE` (exit code 3,
+`dnssec: "unknown"`). The report keeps the validated zone's chain and a warning for
+each incomplete answer. A detected validation failure takes precedence over an
+incomplete answer; an incomplete answer takes precedence over an unsigned answer.
 
 ## The resolver's own answer
 
@@ -296,7 +301,10 @@ UDP, TCP and DNS over TLS ports on `127.0.0.1` and serves a synthetic chain `.` 
 against a test trust anchor. Signature validity uses an injected clock. No real keys or
 secrets are in the repository. Results do not depend on any public domain.
 The web handlers are tested against the same fake resolver. `govulncheck` needs network
-access to the Go vulnerability database. CI runs the same commands on every push and
+access to the Go vulnerability database. Regression tests cover A and AAAA timeouts,
+SERVFAIL and REFUSED after successful zone validation, the CLI exit code and JSON,
+and the web page and API verdicts for incomplete checks.
+CI runs the same commands on every push and
 pull request, and also starts the image and checks `/healthz`, the page and a rejected
 request.
 

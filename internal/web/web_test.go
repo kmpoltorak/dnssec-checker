@@ -87,6 +87,28 @@ func TestAPI(t *testing.T) {
 	}
 }
 
+func TestIncompleteLookupPageAndAPI(t *testing.T) {
+	ts, srv := setup(t, 4)
+	srv.Set("example.com.", dns.TypeAAAA, dnstest.Reply{Rcode: dns.RcodeServerFailure})
+	resp, body := get(t, ts, "/?domain=example.com")
+	for _, want := range []string{`class="verdict unknown"`, "INDETERMINATE", "AAAA answer for example.com. could not be checked", "SOA signed by key"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("incomplete result page lacks %q", want)
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("page status %d", resp.StatusCode)
+	}
+	resp, body = get(t, ts, "/api/check?domain=example.com")
+	var rep checker.Report
+	if err := json.Unmarshal([]byte(body), &rep); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, %v\n%s", resp.StatusCode, err, body)
+	}
+	if rep.Status != checker.Indeterminate || rep.DNSSEC != "unknown" {
+		t.Errorf("status %s, dnssec %s", rep.Status, rep.DNSSEC)
+	}
+}
+
 func TestBadInput(t *testing.T) {
 	ts, _ := setup(t, 4)
 	for _, d := range []string{"", "http://example.com/", "192.0.2.1", "exa<script>mple.com", strings.Repeat("a", 2000)} {

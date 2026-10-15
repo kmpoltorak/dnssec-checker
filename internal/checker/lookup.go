@@ -20,12 +20,17 @@ type Lookup struct {
 
 // checkName validates the A and AAAA answers of name, so that the verdict covers the name
 // itself and not only its zone. A failed answer makes the status BOGUS; an answer that
-// leads into an unsigned zone makes it INSECURE.
+// leads into an unsigned zone makes it INSECURE. An incomplete check is INDETERMINATE.
 func (r *run) checkName(ctx context.Context, name, zone string) {
 	for _, t := range []uint16{dns.TypeA, dns.TypeAAAA} {
 		r.rep.Lookups = append(r.rep.Lookups, r.lookup(ctx, name, t))
 	}
-	for _, want := range []string{StepFail, StepInsecure} {
+	for _, l := range r.rep.Lookups {
+		if l.Result == StepError {
+			r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the %s records of %s could not be checked: %s", l.Type, name, l.Detail))
+		}
+	}
+	for _, want := range []string{StepFail, StepError, StepInsecure} {
 		for _, l := range r.rep.Lookups {
 			if l.Result != want {
 				continue
@@ -42,6 +47,9 @@ func (r *run) checkName(ctx context.Context, name, zone string) {
 						"The resolver itself marks that answer as valid (AD=1), so the resolver or something on the way probably changes answers, "+
 						"for example a DNS filter that drops records. Check again with another resolver using --resolver.", zone, l.Type, name, l.Detail)
 				}
+			} else if want == StepError {
+				r.rep.Status = Indeterminate
+				r.rep.Summary = fmt.Sprintf("The zone %s validates, but the %s answer for %s could not be checked: %s.", zone, l.Type, name, l.Detail)
 			} else {
 				r.rep.Status = Insecure
 				r.rep.Summary = fmt.Sprintf("The zone %s is signed, but the %s answer for %s is not protected: %s.", zone, l.Type, name, l.Detail)
@@ -49,11 +57,7 @@ func (r *run) checkName(ctx context.Context, name, zone string) {
 			return
 		}
 	}
-	for _, l := range r.rep.Lookups {
-		if l.Result == StepError {
-			r.rep.Warnings = append(r.rep.Warnings, fmt.Sprintf("the %s records of %s could not be checked: %s", l.Type, name, l.Detail))
-		}
-	}
+	r.rep.Summary = fmt.Sprintf("DNSSEC is enabled and valid: the chain of trust to %s and the A and AAAA answers for %s validate.", zone, name)
 }
 
 func (r *run) lookup(ctx context.Context, name string, qtype uint16) Lookup {

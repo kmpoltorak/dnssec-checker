@@ -106,6 +106,12 @@ func TestExitCodesAndJSON(t *testing.T) {
 		{"network failure", func(s *dnstest.Server, _, _ *dnstest.Zone) {
 			s.Set("example.com.", dns.TypeSOA, dnstest.Reply{Drop: -1})
 		}, 3, "INDETERMINATE", "unknown"},
+		{"A timeout after zone validation", func(s *dnstest.Server, _, _ *dnstest.Zone) {
+			s.Set("example.com.", dns.TypeA, dnstest.Reply{Drop: -1})
+		}, 3, "INDETERMINATE", "unknown"},
+		{"AAAA timeout after zone validation", func(s *dnstest.Server, _, _ *dnstest.Zone) {
+			s.Set("example.com.", dns.TypeAAAA, dnstest.Reply{Drop: -1})
+		}, 3, "INDETERMINATE", "unknown"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -147,6 +153,7 @@ func TestTextOutput(t *testing.T) {
 	code, out, _ := runCLI(t, "--resolver", srv.Addr, "example.com")
 	for _, want := range []string{
 		"example.com.  DNSSEC: YES, valid (SECURE)", "Chain of trust", "✔ .", "✔ com.", "✔ example.com.",
+		"the chain of trust to example.com. and the A and AAAA answers for example.com. validate.",
 		"matches the IANA root trust anchor", "example.com. DS ", "(agrees)",
 		"Records of example.com.", "✔ A     1 record(s), signed by example.com.", "✔ AAAA  no AAAA records, proven by a signed NSEC record",
 	} {
