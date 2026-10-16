@@ -252,10 +252,13 @@ unsigned or unavailable. An indeterminate zone result cannot be compared and giv
 
 ## Warnings
 
-A signature used for validation gives a warning when it expires within `--warn-expiry`
+For DNSKEY, DS, SOA, A, AAAA, CNAME and DNAME records, a signature used for validation
+gives a warning when it expires within `--warn-expiry`
 **and** has less than a quarter of its validity period left. The second condition keeps
 online signers, which issue short-lived signatures with every answer, from always
-warning. A warning does not change the status.
+warning. The same warning is shown once when a signature is checked for both A and
+AAAA. A warning does not change the status. NSEC/NSEC3 proof signatures are checked
+for validity but do not currently produce expiry warnings.
 
 ## Output
 
