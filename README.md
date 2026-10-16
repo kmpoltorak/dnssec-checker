@@ -198,7 +198,9 @@ whether the resolver validates or on the network path to it.
 5. **The name itself.** The A and AAAA answers for the name are validated too:
    - records must be signed by the zone that the chain of trust reaches for their owner;
    - an answer expanded from a wildcard (RRSIG label count below the owner's) needs a
-     signed proof that the name itself does not exist;
+     signed proof that the name itself does not exist and that the wildcard's parent
+     is the name's closest existing ancestor. For example, an existing `b.example.com`
+     prevents `*.example.com` from answering for `a.b.example.com`;
    - each CNAME in an alias chain must be signed by its zone, even in another zone; a
      CNAME synthesized from a DNAME is unsigned (RFC 6672), so the DNAME is validated;
    - a CNAME expanded from a wildcard needs the same signed proof of non-existence as
@@ -314,6 +316,9 @@ SERVFAIL and REFUSED after successful zone validation, the CLI exit code and JSO
 and the web page and API verdicts for incomplete checks.
 Wildcard CNAME tests cover signed NSEC/NSEC3 proofs, missing, unsigned, expired and
 unrelated proofs, and replay of a wildcard alias at an existing name.
+Closest-ancestor tests reject A, AAAA and CNAME wildcard answers whose signed NSEC
+proof identifies a closer existing ancestor, and accept proofs for correctly placed
+wildcards at the zone apex and below it.
 CI runs the same commands on every push and
 pull request, and also starts the image and checks `/healthz`, the page and a rejected
 request.

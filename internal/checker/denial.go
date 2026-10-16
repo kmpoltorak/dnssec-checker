@@ -181,11 +181,11 @@ func (p *proofs) nxDomain(name string) (via string, ok, optOut bool) {
 	return "", false, false
 }
 
-// noExactMatch proves, for an answer expanded from the wildcard *.ce, that name itself
-// does not exist (RFC 4035 section 5.3.4, RFC 5155 section 8.8).
+// noExactMatch proves that name does not exist and ce is its closest encloser for
+// expansion from *.ce (RFC 4035 section 5.3.4, RFC 5155 section 8.8).
 func (p *proofs) noExactMatch(name, ce string) bool {
-	if p.nsecCovering(name) != nil {
-		return true
+	if n := p.nsecCovering(name); n != nil {
+		return strings.EqualFold(nsecEncloser(name, n), ce)
 	}
 	next := name
 	for !strings.EqualFold(parent(next), ce) && next != "." {
