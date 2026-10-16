@@ -132,12 +132,12 @@ func (r *run) positive(ctx context.Context, l *Lookup, m *dns.Msg, owner string,
 // wildcard checks the proof required for any wildcard expansion, including CNAMEs.
 func (r *run) wildcard(l *Lookup, m *dns.Msg, owner string, z trust, sig *dns.RRSIG) bool {
 	if labels := dns.SplitDomainName(owner); int(sig.Labels) < len(labels) {
-		// Expanded from a wildcard: the name itself must be proven not to exist.
+		// The proof must show that the name is absent and this wildcard applies.
 		ce := dns.Fqdn(strings.Join(labels[len(labels)-int(sig.Labels):], "."))
 		p := collectProofs(m.Ns, z.zone, z.keys, r.now)
 		l.Records = append(l.Records, p.ev...)
 		if !p.noExactMatch(owner, ce) {
-			l.Result, l.Detail = StepFail, fmt.Sprintf("the answer is expanded from *.%s, but there is no valid signed proof that %s does not exist", ce, owner)
+			l.Result, l.Detail = StepFail, fmt.Sprintf("the answer is expanded from *.%s, but there is no valid signed proof that %s does not exist and this wildcard applies", ce, owner)
 			return false
 		}
 		l.Detail += fmt.Sprintf(", expanded from the wildcard *.%s", ce)
