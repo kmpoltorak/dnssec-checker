@@ -38,6 +38,24 @@ layout, limitations) live in `README.md`: read it before changing anything.
 - Every README claim is backed by code or a test. If you cannot point to it, remove it.
 - Plain English, no marketing, no invented numbers.
 
+## README format
+
+Follow the layout of remote-command-orchestrator. Short and scannable; target ~200 lines.
+
+1. Title, then 2–4 sentences: what it does and for which conditions.
+2. One real example (command + output).
+3. 3–5 bullets: the guarantees that matter (safety, validation, failure handling).
+4. Install
+5. Quick start
+6. Reference sections the tool needs (config, usage, API) — tables over prose.
+7. Limitations: honest gaps, including anything not yet tested.
+8. Development: make targets, one paragraph on how the tests work.
+9. One line: "Built with an AI coding assistant. I wrote the spec and reviewed every change."
+10. License
+
+No overview, architecture essays, roadmap, contributing, project structure or
+technology-stack sections unless a user needs them to run the tool.
+
 ## Data and secrets
 
 - Example data only: `example.com` / `example.net`, RFC 5737 addresses.
