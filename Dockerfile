@@ -1,5 +1,5 @@
 # Build a static binary, then run it on a minimal non-root image.
-FROM golang:1.27.2 AS build
+FROM golang:1.27.3 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

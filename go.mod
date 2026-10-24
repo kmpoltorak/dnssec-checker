@@ -1,6 +1,6 @@
 module github.com/kmpoltorak/dnssec-checker
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/miekg/dns v1.1.73
